@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import datetime, timezone
 from math import radians, sin, cos, sqrt, atan2
 
@@ -10,6 +11,22 @@ app = Flask(__name__)
 
 API_KEY = os.environ.get("TRUSTTRACK_API_KEY")
 BASE_URL = "https://api.fm-track.com"
+
+# =========================================================
+# إعدادات تحليل الحركة
+# =========================================================
+
+# إذا تحركت المركبة أكثر من هذه المسافة نعتبرها حركة حقيقية
+MOVEMENT_DISTANCE_METERS = 25
+
+# بعد كم دقيقة من عدم وجود حركة نعتبر المركبة متوقفة
+STOP_AFTER_MINUTES = 5
+
+# إذا كانت بيانات GPS أقدم من هذا الحد نعتبر الاتصال/البيانات قديمة
+STALE_GPS_MINUTES = 15
+
+# ملف حفظ حالة المركبات
+STATE_FILE = "/tmp/forklift_vehicle_state.json"
 
 
 # =========================================================
@@ -74,9 +91,76 @@ KNOWN_LOCATIONS = [
 
 
 # =========================================================
+# أدوات الوقت
+# =========================================================
+def parse_datetime(value):
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+    except Exception:
+        return None
+
+
+def gps_age_minutes(datetime_text):
+    dt = parse_datetime(datetime_text)
+
+    if dt is None:
+        return None
+
+    now = datetime.now(timezone.utc)
+
+    age = (now - dt).total_seconds() / 60
+
+    return round(max(age, 0), 1)
+
+
+def minutes_since(datetime_text):
+    dt = parse_datetime(datetime_text)
+
+    if dt is None:
+        return None
+
+    now = datetime.now(timezone.utc)
+
+    value = (now - dt).total_seconds() / 60
+
+    return round(max(value, 0), 1)
+
+
+def format_duration(minutes):
+    if minutes is None:
+        return "غير معروف"
+
+    if minutes < 1:
+        return "أقل من دقيقة"
+
+    if minutes < 60:
+        return f"{int(minutes)} دقيقة"
+
+    hours = int(minutes // 60)
+    remaining = int(minutes % 60)
+
+    if remaining == 0:
+        return f"{hours} ساعة"
+
+    return f"{hours} ساعة و {remaining} دقيقة"
+
+
+# =========================================================
 # حساب المسافة بين نقطتين GPS
 # =========================================================
 def distance_meters(lat1, lon1, lat2, lon2):
+    try:
+        lat1 = float(lat1)
+        lon1 = float(lon1)
+        lat2 = float(lat2)
+        lon2 = float(lon2)
+    except (TypeError, ValueError):
+        return None
 
     earth_radius = 6371000
 
@@ -88,9 +172,7 @@ def distance_meters(lat1, lon1, lat2, lon2):
 
     a = (
         sin(dlat / 2) ** 2
-        + cos(p1)
-        * cos(p2)
-        * sin(dlon / 2) ** 2
+        + cos(p1) * cos(p2) * sin(dlon / 2) ** 2
     )
 
     c = 2 * atan2(
@@ -102,47 +184,51 @@ def distance_meters(lat1, lon1, lat2, lon2):
 
 
 # =========================================================
-# حساب عمر بيانات GPS
+# تحميل / حفظ ذاكرة الحركة
 # =========================================================
-def gps_age_minutes(datetime_text):
-
-    if not datetime_text:
-        return None
-
+def load_state():
     try:
+        if os.path.exists(STATE_FILE):
+            with open(
+                STATE_FILE,
+                "r",
+                encoding="utf-8"
+            ) as file:
+                data = json.load(file)
 
-        dt = datetime.fromisoformat(
-            datetime_text.replace(
-                "Z",
-                "+00:00"
-            )
-        )
-
-        now = datetime.now(
-            timezone.utc
-        )
-
-        age = (
-            now - dt
-        ).total_seconds() / 60
-
-        return round(
-            max(age, 0),
-            1
-        )
-
+                if isinstance(data, dict):
+                    return data
     except Exception:
+        pass
 
-        return None
+    return {}
+
+
+def save_state(state):
+    try:
+        with open(
+            STATE_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                state,
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+    except Exception as error:
+        print(
+            "State save error:",
+            error
+        )
 
 
 # =========================================================
-# جلب آخر إحداثيات المركبات
+# TrustTrack
 # =========================================================
 def get_vehicles():
-
     if not API_KEY:
-
         raise RuntimeError(
             "TRUSTTRACK_API_KEY is not configured"
         )
@@ -161,13 +247,8 @@ def get_vehicles():
     return response.json()
 
 
-# =========================================================
-# جلب Objects الرسمي - للاختبار
-# =========================================================
 def get_objects():
-
     if not API_KEY:
-
         raise RuntimeError(
             "TRUSTTRACK_API_KEY is not configured"
         )
@@ -187,19 +268,16 @@ def get_objects():
 
 
 # =========================================================
-# تحديد أقرب موقع معروف
+# أقرب موقع معروف
 # =========================================================
 def find_known_location(lat, lon):
-
     if lat is None or lon is None:
-
         return None, None
 
     nearest_name = None
     nearest_distance = None
 
     for location in KNOWN_LOCATIONS:
-
         distance = distance_meters(
             lat,
             lon,
@@ -207,82 +285,277 @@ def find_known_location(lat, lon):
             location["lon"],
         )
 
+        if distance is None:
+            continue
+
         if (
             nearest_distance is None
             or distance < nearest_distance
         ):
-
             nearest_distance = distance
             nearest_name = location["name"]
 
-    return (
-        nearest_name,
-        nearest_distance
-    )
+    return nearest_name, nearest_distance
 
 
 # =========================================================
-# تحليل حالة الحركة
-#
-# ملاحظة:
-# objects-last-coordinate لا يعطينا حتى الآن vehicleStatus
-# الذي رأيناه في واجهة TrustTrack.
-# لذلك لا نخمن حالة المحرك من السرعة وحدها.
+# البحث عن Ignition إذا ظهر مستقبلاً في البيانات
 # =========================================================
-def analyze_movement(coord, age):
+def detect_ignition(vehicle, coord):
+    possible_values = [
+        coord.get("ignition"),
+        coord.get("rawIgnitionStatus"),
+        coord.get("ignition_status"),
+        vehicle.get("ignition"),
+        vehicle.get("rawIgnitionStatus"),
+        vehicle.get("ignition_status"),
+    ]
 
-    raw_status = str(
-        coord.get(
-            "movement_status"
-        )
-        or ""
-    ).lower()
+    for value in possible_values:
+        if value is None:
+            continue
 
-    # إذا كانت بيانات GPS قديمة
-    if age is None or age > 10:
+        text = str(value).strip().lower()
 
-        return (
-            "stale",
-            "بيانات GPS قديمة"
-        )
+        if text in [
+            "on",
+            "running",
+            "true",
+            "1",
+            "ignition_on",
+        ]:
+            return "on"
 
-    # إذا وصلنا مستقبلاً إلى حالة MOVING
-    if raw_status == "moving":
+        if text in [
+            "off",
+            "false",
+            "0",
+            "ignition_off",
+        ]:
+            return "off"
 
-        return (
-            "moving",
-            "متحرك الآن"
-        )
+    return "unknown"
 
-    # حالات توقف محتملة
-    if raw_status in [
-        "stopped",
-        "stop",
-        "stationary",
-        "idle",
-        "parking",
-        "parked",
-        "ignition_off",
-    ]:
 
-        return (
-            "stopped",
-            "متوقف الآن"
-        )
-
-    # لا نخمن الحالة من السرعة
-    return (
-        "unknown",
-        "حالة الحركة غير معروفة"
+# =========================================================
+# تحليل الحركة باستخدام ذاكرة GPS
+# =========================================================
+def analyze_vehicle(vehicle, coord, state):
+    name = str(
+        vehicle.get("name")
+        or vehicle.get("id")
+        or "unknown"
     )
+
+    lat = coord.get("latitude")
+    lon = coord.get("longitude")
+    gps_datetime = coord.get("datetime")
+
+    age = gps_age_minutes(
+        gps_datetime
+    )
+
+    ignition = detect_ignition(
+        vehicle,
+        coord
+    )
+
+    old = state.get(name, {})
+
+    previous_lat = old.get("latitude")
+    previous_lon = old.get("longitude")
+    previous_gps_datetime = old.get(
+        "gps_datetime"
+    )
+
+    last_movement = old.get(
+        "last_movement"
+    )
+
+    movement_distance = 0
+    new_gps_point = False
+    real_movement = False
+
+    # -----------------------------------------
+    # هل وصلت نقطة GPS جديدة؟
+    # -----------------------------------------
+    if (
+        gps_datetime
+        and gps_datetime != previous_gps_datetime
+    ):
+        new_gps_point = True
+
+    # -----------------------------------------
+    # مقارنة الموقع السابق بالموقع الحالي
+    # -----------------------------------------
+    if (
+        new_gps_point
+        and lat is not None
+        and lon is not None
+        and previous_lat is not None
+        and previous_lon is not None
+    ):
+        distance = distance_meters(
+            previous_lat,
+            previous_lon,
+            lat,
+            lon,
+        )
+
+        if distance is not None:
+            movement_distance = round(
+                distance,
+                1
+            )
+
+            if (
+                distance
+                >= MOVEMENT_DISTANCE_METERS
+            ):
+                real_movement = True
+
+    # -----------------------------------------
+    # أول تشغيل للنظام
+    # -----------------------------------------
+    if (
+        previous_lat is None
+        or previous_lon is None
+    ):
+        try:
+            speed = float(
+                coord.get("speed") or 0
+            )
+        except Exception:
+            speed = 0
+
+        # في أول قراءة فقط:
+        # سرعة واضحة + GPS حديث = مؤشر حركة أولي
+        if (
+            age is not None
+            and age <= 5
+            and speed >= 5
+        ):
+            real_movement = True
+
+    # -----------------------------------------
+    # إذا تحرك فعلياً نسجل وقت الحركة
+    # -----------------------------------------
+    if real_movement:
+        last_movement = (
+            gps_datetime
+            or datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
+
+    # -----------------------------------------
+    # إذا لا يوجد تاريخ حركة بعد
+    # نستخدم وقت أول نقطة معروفة
+    # -----------------------------------------
+    if not last_movement:
+        last_movement = (
+            old.get("first_seen")
+            or gps_datetime
+            or datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
+
+    first_seen = old.get(
+        "first_seen"
+    )
+
+    if not first_seen:
+        first_seen = (
+            gps_datetime
+            or datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
+
+    stopped_minutes = minutes_since(
+        last_movement
+    )
+
+    # -----------------------------------------
+    # تحديد الحالة
+    # -----------------------------------------
+
+    # 1 - البيانات قديمة
+    if (
+        age is None
+        or age > STALE_GPS_MINUTES
+    ):
+        status_code = "stale"
+        status_text = "بيانات GPS قديمة"
+
+    # 2 - لدينا حركة GPS حقيقية
+    elif real_movement:
+        status_code = "moving"
+        status_text = "متحرك الآن"
+
+    # 3 - Ignition OFF مؤكد
+    elif ignition == "off":
+        status_code = "engine_off"
+        status_text = "متوقف - المحرك مطفأ"
+
+    # 4 - ثابت أكثر من 5 دقائق
+    elif (
+        stopped_minutes is not None
+        and stopped_minutes
+        >= STOP_AFTER_MINUTES
+    ):
+        if ignition == "on":
+            status_code = "idle"
+            status_text = (
+                "متوقف - المحرك يعمل"
+            )
+        else:
+            status_code = "stopped"
+            status_text = (
+                "متوقف - المحرك غير مؤكد"
+            )
+
+    # 5 - داخل فترة التأكد
+    else:
+        status_code = "checking"
+        status_text = "جاري التحقق من الحركة"
+
+    # -----------------------------------------
+    # تحديث ذاكرة المركبة
+    # -----------------------------------------
+    state[name] = {
+        "latitude": lat,
+        "longitude": lon,
+        "gps_datetime": gps_datetime,
+        "last_movement": last_movement,
+        "first_seen": first_seen,
+        "last_status": status_code,
+        "ignition": ignition,
+    }
+
+    return {
+        "movement_status": status_code,
+        "movement_text": status_text,
+        "ignition": ignition,
+        "last_movement": last_movement,
+        "stopped_minutes": stopped_minutes,
+        "stopped_duration": format_duration(
+            stopped_minutes
+        ),
+        "movement_distance": movement_distance,
+        "new_gps_point": new_gps_point,
+        "gps_age_minutes": age,
+    }
 
 
 # =========================================================
 # تجهيز بيانات المركبات
 # =========================================================
 def prepare_vehicle_data():
-
     data = get_vehicles()
+
+    state = load_state()
 
     vehicles = []
 
@@ -290,7 +563,6 @@ def prepare_vehicle_data():
         "results",
         []
     ):
-
         coord = (
             vehicle.get(
                 "last_coordinate"
@@ -298,56 +570,38 @@ def prepare_vehicle_data():
             or {}
         )
 
-        lat = coord.get(
-            "latitude"
-        )
+        lat = coord.get("latitude")
+        lon = coord.get("longitude")
+        speed = coord.get("speed")
+        dt = coord.get("datetime")
 
-        lon = coord.get(
-            "longitude"
-        )
-
-        speed = coord.get(
-            "speed"
-        )
-
-        dt = coord.get(
-            "datetime"
-        )
-
-        age = gps_age_minutes(
-            dt
-        )
-
-        (
-            location_name,
-            distance
-        ) = find_known_location(
-            lat,
-            lon,
+        location_name, distance = (
+            find_known_location(
+                lat,
+                lon,
+            )
         )
 
         known_location = False
 
-        if distance is not None:
-
+        if (
+            location_name is not None
+            and distance is not None
+        ):
             for location in KNOWN_LOCATIONS:
-
                 if (
                     location["name"]
                     == location_name
                     and distance
                     <= location["radius"]
                 ):
-
                     known_location = True
                     break
 
-        (
-            movement_code,
-            movement_text
-        ) = analyze_movement(
+        analysis = analyze_vehicle(
+            vehicle,
             coord,
-            age,
+            state,
         )
 
         vehicles.append(
@@ -368,18 +622,44 @@ def prepare_vehicle_data():
                     dt,
 
                 "gps_age_minutes":
-                    age,
+                    analysis[
+                        "gps_age_minutes"
+                    ],
 
                 "movement_status":
-                    movement_code,
+                    analysis[
+                        "movement_status"
+                    ],
 
                 "movement_text":
-                    movement_text,
+                    analysis[
+                        "movement_text"
+                    ],
 
-                "raw_movement_status":
-                    coord.get(
-                        "movement_status"
-                    ),
+                "ignition":
+                    analysis[
+                        "ignition"
+                    ],
+
+                "last_movement":
+                    analysis[
+                        "last_movement"
+                    ],
+
+                "stopped_minutes":
+                    analysis[
+                        "stopped_minutes"
+                    ],
+
+                "stopped_duration":
+                    analysis[
+                        "stopped_duration"
+                    ],
+
+                "movement_distance":
+                    analysis[
+                        "movement_distance"
+                    ],
 
                 "known_location":
                     known_location,
@@ -404,25 +684,32 @@ def prepare_vehicle_data():
             }
         )
 
+    save_state(state)
+
     return vehicles
 
 
 # =========================================================
-# الصفحة الرئيسية API
+# API الرئيسي
 # =========================================================
 @app.route("/")
 def home():
-
     try:
-
-        vehicles = (
-            prepare_vehicle_data()
-        )
+        vehicles = prepare_vehicle_data()
 
         return jsonify(
             {
                 "status":
                     "Forklift AI Agent is running",
+
+                "logic":
+                    "GPS + last movement + ignition",
+
+                "stop_after_minutes":
+                    STOP_AFTER_MINUTES,
+
+                "movement_threshold_meters":
+                    MOVEMENT_DISTANCE_METERS,
 
                 "vehicles_count":
                     len(vehicles),
@@ -433,15 +720,11 @@ def home():
         )
 
     except Exception as error:
-
         return (
             jsonify(
                 {
-                    "status":
-                        "error",
-
-                    "message":
-                        str(error),
+                    "status": "error",
+                    "message": str(error),
                 }
             ),
             500,
@@ -449,11 +732,10 @@ def home():
 
 
 # =========================================================
-# Health Check
+# Health
 # =========================================================
 @app.route("/health")
 def health():
-
     return jsonify(
         {
             "status": "ok"
@@ -462,62 +744,28 @@ def health():
 
 
 # =========================================================
-# اختبار Object API الرسمي
-#
-# هذا المسار لا يعرض API KEY
+# Objects API Test
 # =========================================================
 @app.route("/test-objects")
 def test_objects():
-
     try:
-
         data = get_objects()
 
         return jsonify(
             {
                 "status": "ok",
-                "source": "TrustTrack Objects API",
+                "source":
+                    "TrustTrack Objects API",
                 "data": data,
             }
         )
 
-    except requests.exceptions.HTTPError as error:
-
-        status_code = (
-            error.response.status_code
-            if error.response is not None
-            else 500
-        )
-
-        return (
-            jsonify(
-                {
-                    "status":
-                        "error",
-
-                    "type":
-                        "HTTPError",
-
-                    "http_status":
-                        status_code,
-
-                    "message":
-                        str(error),
-                }
-            ),
-            status_code,
-        )
-
     except Exception as error:
-
         return (
             jsonify(
                 {
-                    "status":
-                        "error",
-
-                    "message":
-                        str(error),
+                    "status": "error",
+                    "message": str(error),
                 }
             ),
             500,
@@ -525,16 +773,35 @@ def test_objects():
 
 
 # =========================================================
+# عرض ذاكرة الوكيل للاختبار
+# =========================================================
+@app.route("/movement-state")
+def movement_state():
+    return jsonify(
+        {
+            "status": "ok",
+            "settings": {
+                "movement_distance_meters":
+                    MOVEMENT_DISTANCE_METERS,
+
+                "stop_after_minutes":
+                    STOP_AFTER_MINUTES,
+
+                "stale_gps_minutes":
+                    STALE_GPS_MINUTES,
+            },
+            "vehicles": load_state(),
+        }
+    )
+
+
+# =========================================================
 # Dashboard
 # =========================================================
 @app.route("/dashboard")
 def dashboard():
-
     try:
-
-        vehicles = (
-            prepare_vehicle_data()
-        )
+        vehicles = prepare_vehicle_data()
 
         html = """
 <!DOCTYPE html>
@@ -546,14 +813,12 @@ def dashboard():
 <meta charset="UTF-8">
 
 <meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
->
+name="viewport"
+content="width=device-width, initial-scale=1.0">
 
 <meta
-    http-equiv="refresh"
-    content="30"
->
+http-equiv="refresh"
+content="30">
 
 <title>
 مركز متابعة السائقين
@@ -563,10 +828,7 @@ def dashboard():
 
 body {
     margin: 0;
-    font-family:
-        Arial,
-        Tahoma,
-        sans-serif;
+    font-family: Arial, Tahoma, sans-serif;
     background: #f1f5f9;
     color: #0f172a;
 }
@@ -578,13 +840,18 @@ body {
 }
 
 .header h1 {
-    margin: 0 0 10px 0;
+    margin: 0 0 8px 0;
+}
+
+.header p {
+    margin: 0;
+    opacity: 0.85;
 }
 
 .summary {
-    margin: 28px 6%;
+    margin: 25px 6%;
     background: white;
-    padding: 20px;
+    padding: 18px 22px;
     border-radius: 18px;
 }
 
@@ -592,10 +859,7 @@ body {
     margin: 0 6% 40px 6%;
     display: grid;
     grid-template-columns:
-        repeat(
-            auto-fit,
-            minmax(360px, 1fr)
-        );
+        repeat(auto-fit, minmax(360px, 1fr));
     gap: 20px;
 }
 
@@ -603,8 +867,7 @@ body {
     background: white;
     border-radius: 18px;
     padding: 22px;
-    border-top:
-        5px solid #2563eb;
+    border-top: 5px solid #2563eb;
 }
 
 .name {
@@ -615,10 +878,10 @@ body {
 
 .badge {
     display: inline-block;
-    padding: 9px 15px;
+    padding: 10px 16px;
     border-radius: 30px;
     font-weight: bold;
-    margin-bottom: 15px;
+    margin-bottom: 16px;
 }
 
 .moving {
@@ -626,28 +889,36 @@ body {
     color: #047857;
 }
 
+.idle {
+    background: #fef3c7;
+    color: #92400e;
+}
+
+.engine_off {
+    background: #dbeafe;
+    color: #1d4ed8;
+}
+
 .stopped {
     background: #e2e8f0;
     color: #334155;
 }
 
-.stale {
-    background: #fef3c7;
-    color: #92400e;
+.checking {
+    background: #ede9fe;
+    color: #6d28d9;
 }
 
-.unknown {
-    background: #fee2e2;
-    color: #991b1b;
+.stale {
+    background: #ffedd5;
+    color: #c2410c;
 }
 
 .row {
     display: flex;
-    justify-content:
-        space-between;
+    justify-content: space-between;
     gap: 20px;
-    border-bottom:
-        1px solid #e2e8f0;
+    border-bottom: 1px solid #e2e8f0;
     padding: 11px 0;
 }
 
@@ -664,15 +935,10 @@ body {
     color: #dc2626;
 }
 
-.test-link {
-    display: inline-block;
-    margin-top: 12px;
-    padding: 10px 16px;
-    background: #2563eb;
-    color: white;
-    text-decoration: none;
-    border-radius: 10px;
-    font-weight: bold;
+.footer-note {
+    margin: 0 6% 30px 6%;
+    color: #64748b;
+    font-size: 14px;
 }
 
 </style>
@@ -687,36 +953,31 @@ body {
 مركز متابعة السائقين
 </h1>
 
-<div>
+<p>
 Forklift AI Agent —
-متابعة مباشرة من TrustTrack
-</div>
+تحليل GPS والحركة والتوقف
+</p>
 
 </div>
 
 
 <div class="summary">
 
-عدد المركبات المتصلة:
-
+عدد المركبات:
 <strong>
 {{ vehicles|length }}
 </strong>
 
-&nbsp;&nbsp; | &nbsp;&nbsp;
+&nbsp; | &nbsp;
 
-يتم تحديث اللوحة
-تلقائياً كل 30 ثانية
+التوقف يعتمد بعد
+<strong>5 دقائق</strong>
+من عدم وجود حركة فعلية.
 
-<br>
+&nbsp; | &nbsp;
 
-<a
-    class="test-link"
-    href="/test-objects"
-    target="_blank"
->
-اختبار Objects API
-</a>
+تحديث كل
+<strong>30 ثانية</strong>
 
 </div>
 
@@ -734,7 +995,21 @@ Forklift AI Agent —
 
 <div class="badge {{ v.movement_status }}">
 
-● {{ v.movement_text }}
+{% if v.movement_status == "moving" %}
+🟢
+{% elif v.movement_status == "idle" %}
+🟡
+{% elif v.movement_status == "engine_off" %}
+🔵
+{% elif v.movement_status == "stopped" %}
+⚪
+{% elif v.movement_status == "stale" %}
+🟠
+{% else %}
+🟣
+{% endif %}
+
+{{ v.movement_text }}
 
 </div>
 
@@ -747,8 +1022,77 @@ Forklift AI Agent —
 
 <span class="value">
 
-{{ v.speed if v.speed is not none else 0 }}
+{{ v.speed if v.speed is not none else "غير متوفرة" }}
+
+{% if v.speed is not none %}
 كم/س
+{% endif %}
+
+</span>
+
+</div>
+
+
+<div class="row">
+
+<span class="label">
+آخر حركة مؤكدة
+</span>
+
+<span class="value">
+{{ v.last_movement or "غير معروفة" }}
+</span>
+
+</div>
+
+
+<div class="row">
+
+<span class="label">
+مدة عدم الحركة
+</span>
+
+<span class="value">
+{{ v.stopped_duration }}
+</span>
+
+</div>
+
+
+<div class="row">
+
+<span class="label">
+المسافة منذ القراءة السابقة
+</span>
+
+<span class="value">
+{{ v.movement_distance }} متر
+</span>
+
+</div>
+
+
+<div class="row">
+
+<span class="label">
+حالة المحرك
+</span>
+
+<span class="value">
+
+{% if v.ignition == "on" %}
+
+يعمل
+
+{% elif v.ignition == "off" %}
+
+مطفأ
+
+{% else %}
+
+غير مؤكدة
+
+{% endif %}
 
 </span>
 
@@ -785,9 +1129,7 @@ Forklift AI Agent —
 </span>
 
 <span class="value">
-
 {{ v.nearest_location or "غير معروف" }}
-
 </span>
 
 </div>
@@ -803,8 +1145,7 @@ Forklift AI Agent —
 
 {% if v.distance_meters is not none %}
 
-{{ v.distance_meters }}
-متر
+{{ v.distance_meters }} متر
 
 {% else %}
 
@@ -824,9 +1165,7 @@ Forklift AI Agent —
 </span>
 
 <span class="value">
-
 {{ v.datetime or "غير متوفر" }}
-
 </span>
 
 </div>
@@ -842,8 +1181,7 @@ Forklift AI Agent —
 
 {% if v.gps_age_minutes is not none %}
 
-{{ v.gps_age_minutes }}
-دقيقة
+{{ v.gps_age_minutes }} دقيقة
 
 {% else %}
 
@@ -859,28 +1197,11 @@ Forklift AI Agent —
 <div class="row">
 
 <span class="label">
-حالة TrustTrack الخام
-</span>
-
-<span class="value">
-
-{{ v.raw_movement_status or "غير متوفرة" }}
-
-</span>
-
-</div>
-
-
-<div class="row">
-
-<span class="label">
 خط العرض
 </span>
 
 <span class="value">
-
 {{ v.latitude }}
-
 </span>
 
 </div>
@@ -893,9 +1214,7 @@ Forklift AI Agent —
 </span>
 
 <span class="value">
-
 {{ v.longitude }}
-
 </span>
 
 </div>
@@ -903,6 +1222,17 @@ Forklift AI Agent —
 </div>
 
 {% endfor %}
+
+</div>
+
+
+<div class="footer-note">
+
+🟢 متحرك —
+🟡 متوقف والمحرك يعمل —
+🔵 المحرك مطفأ —
+⚪ متوقف والمحرك غير مؤكد —
+🟠 بيانات GPS قديمة
 
 </div>
 
@@ -917,12 +1247,10 @@ Forklift AI Agent —
         )
 
     except Exception as error:
-
         return f"""
         <html lang="ar" dir="rtl">
         <head>
         <meta charset="UTF-8">
-        <title>خطأ</title>
         </head>
         <body>
         <h2>حدث خطأ</h2>
@@ -936,7 +1264,6 @@ Forklift AI Agent —
 # تشغيل التطبيق
 # =========================================================
 if __name__ == "__main__":
-
     app.run(
         host="0.0.0.0",
         port=int(
