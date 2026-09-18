@@ -1,12 +1,14 @@
 import os
 import math
 import requests
+from datetime import datetime, timezone
 from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
 
 API_KEY = os.environ.get("TRUSTTRACK_API_KEY")
 BASE_URL = "https://api.fm-track.com"
+
 
 # =========================================================
 # المواقع المعروفة
@@ -70,8 +72,12 @@ KNOWN_LOCATIONS = [
 ]
 
 
+# =========================================================
+# حساب المسافة بين نقطتين
+# =========================================================
+
 def distance_meters(lat1, lon1, lat2, lon2):
-    """حساب المسافة بين نقطتين بالمتر."""
+
     earth_radius = 6371000
 
     p1 = math.radians(lat1)
@@ -87,18 +93,88 @@ def distance_meters(lat1, lon1, lat2, lon2):
         * math.sin(dl / 2) ** 2
     )
 
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    c = 2 * math.atan2(
+        math.sqrt(a),
+        math.sqrt(1 - a)
+    )
 
     return earth_radius * c
 
 
-def identify_location(latitude, longitude):
+# =========================================================
+# تحديد حالة الحركة
+# =========================================================
+
+def get_movement_status(speed, gps_datetime):
     """
-    يحدد أقرب موقع معروف.
-    إذا كانت المركبة داخل نصف قطر الموقع يتم اعتبارها داخله.
+    لا نعتمد على السرعة وحدها.
+
+    إذا كان آخر GPS قديماً، لا نقول إن المركبة تتحرك الآن
+    حتى لو كانت آخر سرعة مسجلة أكبر من صفر.
     """
 
+    if not gps_datetime:
+        return {
+            "status": "بيانات GPS غير متوفرة",
+            "gps_age_minutes": None
+        }
+
+    try:
+
+        gps_time = datetime.fromisoformat(
+            gps_datetime.replace("Z", "+00:00")
+        )
+
+        now = datetime.now(timezone.utc)
+
+        age_minutes = (
+            now - gps_time
+        ).total_seconds() / 60
+
+        # حماية في حال اختلاف الساعة
+        if age_minutes < 0:
+            age_minutes = 0
+
+        speed_value = float(speed or 0)
+
+        # آخر تحديث أقدم من 5 دقائق
+        if age_minutes > 5:
+
+            return {
+                "status": "بيانات GPS قديمة",
+                "gps_age_minutes": round(age_minutes, 1)
+            }
+
+        # 0 - 2 كم/س نعتبرها توقف
+        # لتقليل تأثير اهتزاز GPS
+        if speed_value <= 2:
+
+            return {
+                "status": "متوقف",
+                "gps_age_minutes": round(age_minutes, 1)
+            }
+
+        return {
+            "status": "متحرك",
+            "gps_age_minutes": round(age_minutes, 1)
+        }
+
+    except Exception:
+
+        return {
+            "status": "حالة غير معروفة",
+            "gps_age_minutes": None
+        }
+
+
+# =========================================================
+# تحديد الموقع المعروف
+# =========================================================
+
+def identify_location(latitude, longitude):
+
     if latitude is None or longitude is None:
+
         return {
             "location": "الموقع غير متوفر",
             "known_location": False,
@@ -117,11 +193,19 @@ def identify_location(latitude, longitude):
             place["longitude"]
         )
 
-        if nearest_distance is None or distance < nearest_distance:
+        if (
+            nearest_distance is None
+            or distance < nearest_distance
+        ):
+
             nearest_distance = distance
             nearest = place
 
-    if nearest and nearest_distance <= nearest["radius"]:
+    if (
+        nearest
+        and nearest_distance <= nearest["radius"]
+    ):
+
         return {
             "location": nearest["name"],
             "known_location": True,
@@ -131,14 +215,23 @@ def identify_location(latitude, longitude):
     return {
         "location": "خارج المواقع المعروفة",
         "known_location": False,
-        "distance_meters": round(nearest_distance) if nearest_distance else None
+        "distance_meters":
+            round(nearest_distance)
+            if nearest_distance is not None
+            else None
     }
 
+
+# =========================================================
+# الاتصال بـ TrustTrack
+# =========================================================
 
 def get_vehicles():
 
     if not API_KEY:
-        raise RuntimeError("TRUSTTRACK_API_KEY is not configured")
+        raise RuntimeError(
+            "TRUSTTRACK_API_KEY is not configured"
+        )
 
     response = requests.get(
         f"{BASE_URL}/objects-last-coordinate",
@@ -154,6 +247,10 @@ def get_vehicles():
     return response.json()
 
 
+# =========================================================
+# تجهيز بيانات المركبات
+# =========================================================
+
 def build_vehicle_list():
 
     data = get_vehicles()
@@ -166,25 +263,53 @@ def build_vehicle_list():
 
         latitude = coord.get("latitude")
         longitude = coord.get("longitude")
+        speed = coord.get("speed")
+        gps_datetime = coord.get("datetime")
 
         location_info = identify_location(
             latitude,
             longitude
         )
 
+        movement_info = get_movement_status(
+            speed,
+            gps_datetime
+        )
+
         vehicles.append({
+
             "name": vehicle.get("name"),
-            "speed": coord.get("speed"),
+
+            "speed": speed,
+
             "latitude": latitude,
+
             "longitude": longitude,
-            "datetime": coord.get("datetime"),
-            "location": location_info["location"],
-            "known_location": location_info["known_location"],
-            "distance_meters": location_info["distance_meters"]
+
+            "datetime": gps_datetime,
+
+            "movement_status":
+                movement_info["status"],
+
+            "gps_age_minutes":
+                movement_info["gps_age_minutes"],
+
+            "location":
+                location_info["location"],
+
+            "known_location":
+                location_info["known_location"],
+
+            "distance_meters":
+                location_info["distance_meters"]
         })
 
     return vehicles
 
+
+# =========================================================
+# API الرئيسية
+# =========================================================
 
 @app.route("/")
 def home():
@@ -195,8 +320,8 @@ def home():
 
         return jsonify({
             "status": "Forklift AI Agent is running",
-            "vehicles": vehicles,
-            "vehicles_count": len(vehicles)
+            "vehicles_count": len(vehicles),
+            "vehicles": vehicles
         })
 
     except Exception as error:
@@ -207,6 +332,10 @@ def home():
         }), 500
 
 
+# =========================================================
+# فحص الخدمة
+# =========================================================
+
 @app.route("/health")
 def health():
 
@@ -214,6 +343,10 @@ def health():
         "status": "ok"
     })
 
+
+# =========================================================
+# لوحة المتابعة
+# =========================================================
 
 @app.route("/dashboard")
 def dashboard():
@@ -233,7 +366,8 @@ def dashboard():
 
 <meta http-equiv="refresh" content="30">
 
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport"
+content="width=device-width, initial-scale=1">
 
 <title>مركز متابعة السائقين</title>
 
@@ -276,7 +410,8 @@ header p {
 
 .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit,minmax(360px,1fr));
+    grid-template-columns:
+        repeat(auto-fit,minmax(360px,1fr));
     gap: 20px;
 }
 
@@ -294,21 +429,32 @@ header p {
     margin-bottom: 15px;
 }
 
-.moving {
+.status {
     display: inline-block;
-    background: #dcfce7;
-    color: #08783d;
     padding: 8px 15px;
     border-radius: 30px;
     font-weight: bold;
+    margin-bottom: 10px;
+}
+
+.moving {
+    background: #dcfce7;
+    color: #08783d;
 }
 
 .stopped {
-    display: inline-block;
-    background: #f3f4f6;
-    padding: 8px 15px;
-    border-radius: 30px;
-    font-weight: bold;
+    background: #e5e7eb;
+    color: #374151;
+}
+
+.old {
+    background: #fef3c7;
+    color: #92400e;
+}
+
+.unknown-status {
+    background: #fee2e2;
+    color: #991b1b;
 }
 
 .known {
@@ -324,6 +470,7 @@ header p {
 .row {
     display: flex;
     justify-content: space-between;
+    gap: 20px;
     border-bottom: 1px solid #e5e7eb;
     padding: 12px 0;
 }
@@ -334,6 +481,7 @@ header p {
 
 .value {
     font-weight: bold;
+    text-align: left;
 }
 
 </style>
@@ -344,18 +492,28 @@ header p {
 
 <header>
 
-<h1>مركز متابعة السائقين</h1>
+<h1>
+مركز متابعة السائقين
+</h1>
 
-<p>Forklift AI Agent — متابعة مباشرة من TrustTrack</p>
+<p>
+Forklift AI Agent —
+متابعة مباشرة من TrustTrack
+</p>
 
 </header>
 
+
 <div class="container">
+
 
 <div class="summary">
 
 عدد المركبات المتصلة:
-<strong>{{ vehicles|length }}</strong>
+
+<strong>
+{{ vehicles|length }}
+</strong>
 
 &nbsp;&nbsp; | &nbsp;&nbsp;
 
@@ -363,41 +521,61 @@ header p {
 
 </div>
 
+
 <div class="grid">
+
 
 {% for vehicle in vehicles %}
 
+
 <div class="card">
+
 
 <div class="name">
 {{ vehicle.name }}
 </div>
 
-{% if vehicle.speed and vehicle.speed > 0 %}
 
-<span class="moving">
-● متحرك
+{% if vehicle.movement_status == "متحرك" %}
+
+<span class="status moving">
+● متحرك الآن
+</span>
+
+{% elif vehicle.movement_status == "متوقف" %}
+
+<span class="status stopped">
+● متوقف
+</span>
+
+{% elif vehicle.movement_status == "بيانات GPS قديمة" %}
+
+<span class="status old">
+● بيانات GPS قديمة
 </span>
 
 {% else %}
 
-<span class="stopped">
-● متوقف
+<span class="status unknown-status">
+● {{ vehicle.movement_status }}
 </span>
 
 {% endif %}
 
+
 <div class="row">
 
 <span class="label">
-السرعة
+آخر سرعة مسجلة
 </span>
 
 <span class="value">
-{{ vehicle.speed }} كم/س
+{{ vehicle.speed if vehicle.speed is not none else 0 }}
+كم/س
 </span>
 
 </div>
+
 
 <div class="row">
 
@@ -421,6 +599,7 @@ header p {
 
 </div>
 
+
 <div class="row">
 
 <span class="label">
@@ -428,10 +607,21 @@ header p {
 </span>
 
 <span class="value">
+
+{% if vehicle.distance_meters is not none %}
+
 {{ vehicle.distance_meters }} متر
+
+{% else %}
+
+غير متوفر
+
+{% endif %}
+
 </span>
 
 </div>
+
 
 <div class="row">
 
@@ -445,6 +635,30 @@ header p {
 
 </div>
 
+
+<div class="row">
+
+<span class="label">
+عمر بيانات GPS
+</span>
+
+<span class="value">
+
+{% if vehicle.gps_age_minutes is not none %}
+
+{{ vehicle.gps_age_minutes }} دقيقة
+
+{% else %}
+
+غير متوفر
+
+{% endif %}
+
+</span>
+
+</div>
+
+
 <div class="row">
 
 <span class="label">
@@ -456,6 +670,7 @@ header p {
 </span>
 
 </div>
+
 
 <div class="row">
 
@@ -469,13 +684,17 @@ header p {
 
 </div>
 
+
 </div>
+
 
 {% endfor %}
 
+
 </div>
 
 </div>
+
 
 </body>
 
@@ -490,6 +709,29 @@ header p {
     except Exception as error:
 
         return f"""
+        <html lang="ar" dir="rtl">
+        <body>
         <h2>حدث خطأ</h2>
         <p>{error}</p>
+        </body>
+        </html>
         """, 500
+
+
+# =========================================================
+# تشغيل محلي
+# =========================================================
+
+if __name__ == "__main__":
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
