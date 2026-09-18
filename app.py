@@ -1,7 +1,7 @@
 import os
-import math
-import requests
 from datetime import datetime, timezone
+
+import requests
 from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
@@ -12,222 +12,116 @@ BASE_URL = "https://api.fm-track.com"
 
 # =========================================================
 # المواقع المعروفة
+# أضف/عدّل الإحداثيات هنا لاحقاً
 # =========================================================
-
 KNOWN_LOCATIONS = [
     {
         "name": "مكان استراحة لكل السائقين",
-        "latitude": 18.2545556,
-        "longitude": 42.7488583,
-        "radius": 150
+        "lat": 18.254166,
+        "lon": 42.748861,
+        "radius": 250,
     },
     {
         "name": "مكان توقف للسائقين",
-        "latitude": 18.2524111,
-        "longitude": 42.7523722,
-        "radius": 150
+        "lat": 18.252444,
+        "lon": 42.752450,
+        "radius": 250,
     },
     {
         "name": "مطعم لكل السائقين",
-        "latitude": 18.2454778,
-        "longitude": 42.7364222,
-        "radius": 150
+        "lat": 18.244783,
+        "lon": 42.736450,
+        "radius": 250,
     },
     {
         "name": "مطعم 2 لكل السائقين",
-        "latitude": 18.2534722,
-        "longitude": 42.7534611,
-        "radius": 150
+        "lat": 18.253472,
+        "lon": 42.753461,
+        "radius": 250,
     },
     {
         "name": "مطعم 3 وورشة لكل السائقين",
-        "latitude": 18.3361528,
-        "longitude": 42.7338361,
-        "radius": 150
+        "lat": 18.336114,
+        "lon": 42.733892,
+        "radius": 250,
     },
     {
         "name": "ورشة لكل السائقين",
-        "latitude": 18.2534472,
-        "longitude": 42.7837839,
-        "radius": 150
+        "lat": 18.211503,
+        "lon": 42.783725,
+        "radius": 250,
     },
     {
         "name": "موقع انتظار للسائقين",
-        "latitude": 18.2524500,
-        "longitude": 42.7490500,
-        "radius": 150
+        "lat": 18.252450,
+        "lon": 42.749047,
+        "radius": 250,
     },
     {
         "name": "ورشة",
-        "latitude": 18.3869111,
-        "longitude": 42.7035778,
-        "radius": 150
+        "lat": 18.386911,
+        "lon": 42.702189,
+        "radius": 250,
     },
     {
         "name": "ورشة رافعات",
-        "latitude": 18.3907028,
-        "longitude": 42.7072861,
-        "radius": 150
-    }
+        "lat": 18.390703,
+        "lon": 42.723897,
+        "radius": 250,
+    },
 ]
 
 
 # =========================================================
-# حساب المسافة بين نقطتين
+# حساب المسافة بين نقطتين GPS
 # =========================================================
-
 def distance_meters(lat1, lon1, lat2, lon2):
+    from math import radians, sin, cos, sqrt, atan2
 
     earth_radius = 6371000
 
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
+    p1 = radians(lat1)
+    p2 = radians(lat2)
 
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
 
     a = (
-        math.sin(dp / 2) ** 2
-        + math.cos(p1)
-        * math.cos(p2)
-        * math.sin(dl / 2) ** 2
+        sin(dlat / 2) ** 2
+        + cos(p1) * cos(p2) * sin(dlon / 2) ** 2
     )
 
-    c = 2 * math.atan2(
-        math.sqrt(a),
-        math.sqrt(1 - a)
-    )
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
 
     return earth_radius * c
 
 
 # =========================================================
-# تحديد حالة الحركة
+# حساب عمر بيانات GPS
 # =========================================================
-
-def get_movement_status(speed, gps_datetime):
-    """
-    لا نعتمد على السرعة وحدها.
-
-    إذا كان آخر GPS قديماً، لا نقول إن المركبة تتحرك الآن
-    حتى لو كانت آخر سرعة مسجلة أكبر من صفر.
-    """
-
-    if not gps_datetime:
-        return {
-            "status": "بيانات GPS غير متوفرة",
-            "gps_age_minutes": None
-        }
+def gps_age_minutes(datetime_text):
+    if not datetime_text:
+        return None
 
     try:
-
-        gps_time = datetime.fromisoformat(
-            gps_datetime.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(
+            datetime_text.replace("Z", "+00:00")
         )
 
         now = datetime.now(timezone.utc)
 
-        age_minutes = (
-            now - gps_time
-        ).total_seconds() / 60
+        age = (now - dt).total_seconds() / 60
 
-        # حماية في حال اختلاف الساعة
-        if age_minutes < 0:
-            age_minutes = 0
-
-        speed_value = float(speed or 0)
-
-        # آخر تحديث أقدم من 5 دقائق
-        if age_minutes > 5:
-
-            return {
-                "status": "بيانات GPS قديمة",
-                "gps_age_minutes": round(age_minutes, 1)
-            }
-
-        # 0 - 2 كم/س نعتبرها توقف
-        # لتقليل تأثير اهتزاز GPS
-        if speed_value <= 2:
-
-            return {
-                "status": "متوقف",
-                "gps_age_minutes": round(age_minutes, 1)
-            }
-
-        return {
-            "status": "متحرك",
-            "gps_age_minutes": round(age_minutes, 1)
-        }
+        return round(max(age, 0), 1)
 
     except Exception:
-
-        return {
-            "status": "حالة غير معروفة",
-            "gps_age_minutes": None
-        }
+        return None
 
 
 # =========================================================
-# تحديد الموقع المعروف
+# جلب بيانات المركبات من TrustTrack
 # =========================================================
-
-def identify_location(latitude, longitude):
-
-    if latitude is None or longitude is None:
-
-        return {
-            "location": "الموقع غير متوفر",
-            "known_location": False,
-            "distance_meters": None
-        }
-
-    nearest = None
-    nearest_distance = None
-
-    for place in KNOWN_LOCATIONS:
-
-        distance = distance_meters(
-            latitude,
-            longitude,
-            place["latitude"],
-            place["longitude"]
-        )
-
-        if (
-            nearest_distance is None
-            or distance < nearest_distance
-        ):
-
-            nearest_distance = distance
-            nearest = place
-
-    if (
-        nearest
-        and nearest_distance <= nearest["radius"]
-    ):
-
-        return {
-            "location": nearest["name"],
-            "known_location": True,
-            "distance_meters": round(nearest_distance)
-        }
-
-    return {
-        "location": "خارج المواقع المعروفة",
-        "known_location": False,
-        "distance_meters":
-            round(nearest_distance)
-            if nearest_distance is not None
-            else None
-    }
-
-
-# =========================================================
-# الاتصال بـ TrustTrack
-# =========================================================
-
 def get_vehicles():
-
     if not API_KEY:
         raise RuntimeError(
             "TRUSTTRACK_API_KEY is not configured"
@@ -237,9 +131,9 @@ def get_vehicles():
         f"{BASE_URL}/objects-last-coordinate",
         params={
             "version": 2,
-            "api_key": API_KEY
+            "api_key": API_KEY,
         },
-        timeout=20
+        timeout=20,
     )
 
     response.raise_for_status()
@@ -248,10 +142,86 @@ def get_vehicles():
 
 
 # =========================================================
+# تحديد أقرب موقع معروف
+# =========================================================
+def find_known_location(lat, lon):
+
+    if lat is None or lon is None:
+        return None, None
+
+    nearest_name = None
+    nearest_distance = None
+
+    for location in KNOWN_LOCATIONS:
+
+        distance = distance_meters(
+            lat,
+            lon,
+            location["lat"],
+            location["lon"],
+        )
+
+        if (
+            nearest_distance is None
+            or distance < nearest_distance
+        ):
+            nearest_distance = distance
+            nearest_name = location["name"]
+
+    return nearest_name, nearest_distance
+
+
+# =========================================================
+# تحليل حالة الحركة
+# =========================================================
+def analyze_movement(coord, age):
+
+    raw_status = str(
+        coord.get("movement_status") or ""
+    ).lower()
+
+    speed = coord.get("speed")
+
+    try:
+        speed = float(speed or 0)
+    except Exception:
+        speed = 0
+
+    # GPS قديم: لا نحكم على الحالة الحالية
+    if age is None or age > 10:
+        return "stale", "بيانات GPS قديمة"
+
+    # إذا TrustTrack أكد الحركة
+    if raw_status == "moving":
+        return "moving", "متحرك الآن"
+
+    # إذا TrustTrack أكد التوقف
+    if raw_status in [
+        "stopped",
+        "stop",
+        "stationary",
+        "idle",
+        "parking",
+        "parked",
+    ]:
+        return "stopped", "متوقف الآن"
+
+    # إذا الحالة unknown لا نخترع حالة
+    if raw_status in [
+        "unknown",
+        "",
+        "none",
+        "null",
+    ]:
+        return "unknown", "حالة الحركة غير معروفة"
+
+    return "unknown", "حالة الحركة غير معروفة"
+
+
+# =========================================================
 # تجهيز بيانات المركبات
 # =========================================================
-
-def build_vehicle_list():
+def prepare_vehicle_data():
 
     data = get_vehicles()
 
@@ -261,99 +231,127 @@ def build_vehicle_list():
 
         coord = vehicle.get("last_coordinate") or {}
 
-        latitude = coord.get("latitude")
-        longitude = coord.get("longitude")
+        lat = coord.get("latitude")
+        lon = coord.get("longitude")
         speed = coord.get("speed")
-        gps_datetime = coord.get("datetime")
+        dt = coord.get("datetime")
 
-        location_info = identify_location(
-            latitude,
-            longitude
+        age = gps_age_minutes(dt)
+
+        location_name, distance = find_known_location(
+            lat,
+            lon,
         )
 
-        movement_info = get_movement_status(
-            speed,
-            gps_datetime
+        known_location = False
+
+        if distance is not None:
+            for location in KNOWN_LOCATIONS:
+                if (
+                    location["name"] == location_name
+                    and distance <= location["radius"]
+                ):
+                    known_location = True
+                    break
+
+        movement_code, movement_text = analyze_movement(
+            coord,
+            age,
         )
 
-        vehicles.append({
+        vehicles.append(
+            {
+                "name": vehicle.get("name"),
+                "speed": speed,
+                "latitude": lat,
+                "longitude": lon,
+                "datetime": dt,
 
-            "name": vehicle.get("name"),
+                "gps_age_minutes": age,
 
-            "speed": speed,
+                "movement_status": movement_code,
+                "movement_text": movement_text,
 
-            "latitude": latitude,
+                "raw_movement_status":
+                    coord.get("movement_status"),
 
-            "longitude": longitude,
+                "known_location": known_location,
 
-            "datetime": gps_datetime,
+                "location":
+                    location_name
+                    if known_location
+                    else "خارج المواقع المعروفة",
 
-            "movement_status":
-                movement_info["status"],
+                "nearest_location": location_name,
 
-            "gps_age_minutes":
-                movement_info["gps_age_minutes"],
-
-            "location":
-                location_info["location"],
-
-            "known_location":
-                location_info["known_location"],
-
-            "distance_meters":
-                location_info["distance_meters"]
-        })
+                "distance_meters":
+                    round(distance)
+                    if distance is not None
+                    else None,
+            }
+        )
 
     return vehicles
 
 
 # =========================================================
-# API الرئيسية
+# API الرئيسي
 # =========================================================
-
 @app.route("/")
 def home():
 
     try:
 
-        vehicles = build_vehicle_list()
+        vehicles = prepare_vehicle_data()
 
-        return jsonify({
-            "status": "Forklift AI Agent is running",
-            "vehicles_count": len(vehicles),
-            "vehicles": vehicles
-        })
+        return jsonify(
+            {
+                "status":
+                    "Forklift AI Agent is running",
+
+                "vehicles_count":
+                    len(vehicles),
+
+                "vehicles":
+                    vehicles,
+            }
+        )
 
     except Exception as error:
 
-        return jsonify({
-            "status": "error",
-            "message": str(error)
-        }), 500
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": str(error),
+                }
+            ),
+            500,
+        )
 
 
 # =========================================================
-# فحص الخدمة
+# Health Check
 # =========================================================
-
 @app.route("/health")
 def health():
 
-    return jsonify({
-        "status": "ok"
-    })
+    return jsonify(
+        {
+            "status": "ok",
+        }
+    )
 
 
 # =========================================================
-# لوحة المتابعة
+# Dashboard
 # =========================================================
-
 @app.route("/dashboard")
 def dashboard():
 
     try:
 
-        vehicles = build_vehicle_list()
+        vehicles = prepare_vehicle_data()
 
         html = """
 <!DOCTYPE html>
@@ -364,10 +362,10 @@ def dashboard():
 
 <meta charset="UTF-8">
 
-<meta http-equiv="refresh" content="30">
-
 <meta name="viewport"
-content="width=device-width, initial-scale=1">
+content="width=device-width, initial-scale=1.0">
+
+<meta http-equiv="refresh" content="30">
 
 <title>مركز متابعة السائقين</title>
 
@@ -376,112 +374,93 @@ content="width=device-width, initial-scale=1">
 body {
     margin: 0;
     font-family: Arial, Tahoma, sans-serif;
-    background: #f3f6fa;
-    color: #111827;
+    background: #f1f5f9;
+    color: #0f172a;
 }
 
-header {
-    background: #162136;
+.header {
+    background: #14213d;
     color: white;
-    padding: 25px 6%;
+    padding: 28px 6%;
 }
 
-header h1 {
-    margin: 0;
-    font-size: 27px;
-}
-
-header p {
-    margin-bottom: 0;
-}
-
-.container {
-    width: 88%;
-    margin: 28px auto;
+.header h1 {
+    margin: 0 0 10px 0;
 }
 
 .summary {
+    margin: 28px 6%;
     background: white;
     padding: 20px;
-    border-radius: 16px;
-    margin-bottom: 22px;
-    box-shadow: 0 5px 20px rgba(0,0,0,.04);
+    border-radius: 18px;
 }
 
 .grid {
+    margin: 0 6% 40px 6%;
     display: grid;
     grid-template-columns:
-        repeat(auto-fit,minmax(360px,1fr));
+        repeat(auto-fit, minmax(360px, 1fr));
     gap: 20px;
 }
 
 .card {
     background: white;
-    border-radius: 17px;
+    border-radius: 18px;
     padding: 22px;
-    border-top: 5px solid #2f6fed;
-    box-shadow: 0 5px 20px rgba(0,0,0,.06);
+    border-top: 5px solid #2563eb;
 }
 
 .name {
-    font-size: 27px;
+    font-size: 28px;
     font-weight: bold;
     margin-bottom: 15px;
 }
 
-.status {
+.badge {
     display: inline-block;
-    padding: 8px 15px;
+    padding: 9px 15px;
     border-radius: 30px;
     font-weight: bold;
-    margin-bottom: 10px;
+    margin-bottom: 15px;
 }
 
 .moving {
     background: #dcfce7;
-    color: #08783d;
+    color: #047857;
 }
 
 .stopped {
-    background: #e5e7eb;
-    color: #374151;
+    background: #e2e8f0;
+    color: #334155;
 }
 
-.old {
+.stale {
     background: #fef3c7;
     color: #92400e;
 }
 
-.unknown-status {
+.unknown {
     background: #fee2e2;
     color: #991b1b;
-}
-
-.known {
-    color: #08783d;
-    font-weight: bold;
-}
-
-.unknown {
-    color: #c62828;
-    font-weight: bold;
 }
 
 .row {
     display: flex;
     justify-content: space-between;
-    gap: 20px;
-    border-bottom: 1px solid #e5e7eb;
-    padding: 12px 0;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 11px 0;
 }
 
 .label {
-    color: #667085;
+    color: #64748b;
 }
 
 .value {
     font-weight: bold;
-    text-align: left;
+}
+
+.warning {
+    color: #dc2626;
 }
 
 </style>
@@ -490,30 +469,22 @@ header p {
 
 <body>
 
-<header>
+<div class="header">
 
-<h1>
-مركز متابعة السائقين
-</h1>
+<h1>مركز متابعة السائقين</h1>
 
-<p>
+<div>
 Forklift AI Agent —
 متابعة مباشرة من TrustTrack
-</p>
+</div>
 
-</header>
-
-
-<div class="container">
+</div>
 
 
 <div class="summary">
 
 عدد المركبات المتصلة:
-
-<strong>
-{{ vehicles|length }}
-</strong>
+<strong>{{ vehicles|length }}</strong>
 
 &nbsp;&nbsp; | &nbsp;&nbsp;
 
@@ -524,43 +495,18 @@ Forklift AI Agent —
 
 <div class="grid">
 
-
-{% for vehicle in vehicles %}
-
+{% for v in vehicles %}
 
 <div class="card">
 
-
 <div class="name">
-{{ vehicle.name }}
+{{ v.name }}
 </div>
 
 
-{% if vehicle.movement_status == "متحرك" %}
-
-<span class="status moving">
-● متحرك الآن
-</span>
-
-{% elif vehicle.movement_status == "متوقف" %}
-
-<span class="status stopped">
-● متوقف
-</span>
-
-{% elif vehicle.movement_status == "بيانات GPS قديمة" %}
-
-<span class="status old">
-● بيانات GPS قديمة
-</span>
-
-{% else %}
-
-<span class="status unknown-status">
-● {{ vehicle.movement_status }}
-</span>
-
-{% endif %}
+<div class="badge {{ v.movement_status }}">
+● {{ v.movement_text }}
+</div>
 
 
 <div class="row">
@@ -570,8 +516,7 @@ Forklift AI Agent —
 </span>
 
 <span class="value">
-{{ vehicle.speed if vehicle.speed is not none else 0 }}
-كم/س
+{{ v.speed }} كم/س
 </span>
 
 </div>
@@ -583,16 +528,16 @@ Forklift AI Agent —
 الموقع
 </span>
 
-{% if vehicle.known_location %}
+{% if v.known_location %}
 
-<span class="known">
-{{ vehicle.location }}
+<span class="value">
+{{ v.location }}
 </span>
 
 {% else %}
 
-<span class="unknown">
-{{ vehicle.location }}
+<span class="value warning">
+خارج المواقع المعروفة
 </span>
 
 {% endif %}
@@ -603,14 +548,27 @@ Forklift AI Agent —
 <div class="row">
 
 <span class="label">
-المسافة لأقرب موقع مسجل
+أقرب موقع مسجل
+</span>
+
+<span class="value">
+{{ v.nearest_location or "غير معروف" }}
+</span>
+
+</div>
+
+
+<div class="row">
+
+<span class="label">
+المسافة لأقرب موقع
 </span>
 
 <span class="value">
 
-{% if vehicle.distance_meters is not none %}
+{% if v.distance_meters is not none %}
 
-{{ vehicle.distance_meters }} متر
+{{ v.distance_meters }} متر
 
 {% else %}
 
@@ -630,7 +588,7 @@ Forklift AI Agent —
 </span>
 
 <span class="value">
-{{ vehicle.datetime }}
+{{ v.datetime or "غير متوفر" }}
 </span>
 
 </div>
@@ -644,16 +602,29 @@ Forklift AI Agent —
 
 <span class="value">
 
-{% if vehicle.gps_age_minutes is not none %}
+{% if v.gps_age_minutes is not none %}
 
-{{ vehicle.gps_age_minutes }} دقيقة
+{{ v.gps_age_minutes }} دقيقة
 
 {% else %}
 
-غير متوفر
+غير معروف
 
 {% endif %}
 
+</span>
+
+</div>
+
+
+<div class="row">
+
+<span class="label">
+حالة TrustTrack الخام
+</span>
+
+<span class="value">
+{{ v.raw_movement_status or "غير متوفرة" }}
 </span>
 
 </div>
@@ -666,7 +637,7 @@ Forklift AI Agent —
 </span>
 
 <span class="value">
-{{ vehicle.latitude }}
+{{ v.latitude }}
 </span>
 
 </div>
@@ -679,59 +650,37 @@ Forklift AI Agent —
 </span>
 
 <span class="value">
-{{ vehicle.longitude }}
+{{ v.longitude }}
 </span>
 
 </div>
 
-
 </div>
-
 
 {% endfor %}
 
-
 </div>
-
-</div>
-
 
 </body>
-
 </html>
 """
 
         return render_template_string(
             html,
-            vehicles=vehicles
+            vehicles=vehicles,
         )
 
     except Exception as error:
 
         return f"""
-        <html lang="ar" dir="rtl">
-        <body>
         <h2>حدث خطأ</h2>
-        <p>{error}</p>
-        </body>
-        </html>
+        <pre>{error}</pre>
         """, 500
 
 
-# =========================================================
-# تشغيل محلي
-# =========================================================
-
 if __name__ == "__main__":
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
 
     app.run(
         host="0.0.0.0",
-        port=port
+        port=int(os.environ.get("PORT", 10000)),
     )
