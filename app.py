@@ -529,6 +529,12 @@ def analyze_vehicle(
         "first_seen"
     )
 
+    # الحالة السابقة قبل تحديث ذاكرة المركبة
+    # نستخدمها لتسجيل الحدث فقط عند تغيّر الحالة
+    previous_status = old.get(
+        "last_status"
+    )
+
     movement_distance = 0
     new_gps_point = False
     real_movement = False
