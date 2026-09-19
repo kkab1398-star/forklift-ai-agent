@@ -29,6 +29,8 @@ STALE_GPS_MINUTES = 15
 
 # ذاكرة مؤقتة لحالة المركبات
 STATE_FILE = "/tmp/forklift_vehicle_state.json"
+HISTORY_FILE = "/tmp/forklift_event_history.json"
+MAX_HISTORY_EVENTS = 1000
 
 
 # =========================================================
@@ -281,6 +283,35 @@ def save_state(state):
 
 
 # =========================================================
+# سجل الأحداث المؤقت
+# =========================================================
+def load_history():
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "r", encoding="utf-8") as file:
+                data = json.load(file)
+                if isinstance(data, list):
+                    return data
+    except Exception:
+        pass
+    return []
+
+
+def save_history(history):
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as file:
+            json.dump(history[-MAX_HISTORY_EVENTS:], file, ensure_ascii=False, indent=2)
+    except Exception as error:
+        print("History save error:", error)
+
+
+def record_event(event):
+    history = load_history()
+    history.append(event)
+    save_history(history)
+
+
+# =========================================================
 # جلب المركبات من TrustTrack
 # =========================================================
 def get_vehicles():
@@ -463,6 +494,11 @@ def analyze_vehicle(
         gps_datetime
     )
 
+    try:
+        speed = float(coord.get("speed") or 0)
+    except Exception:
+        speed = 0
+
     ignition = detect_ignition(
         vehicle,
         coord
@@ -542,33 +578,16 @@ def analyze_vehicle(
 
 
     # =====================================================
-    # أول تشغيل للوكيل
-    #
-    # لا يوجد موقع سابق للمقارنة.
-    # نستخدم السرعة فقط كمؤشر أولي إذا كان GPS حديثاً.
+    # مؤشر السرعة
+    # GPS حديث + سرعة 5 كم/س أو أكثر = حركة مؤكدة
+    # يعمل في كل قراءة، وليس في أول تشغيل فقط
     # =====================================================
     if (
-        previous_lat is None
-        or previous_lon is None
+        age is not None
+        and age <= 5
+        and speed >= 5
     ):
-
-        try:
-            speed = float(
-                coord.get(
-                    "speed"
-                )
-                or 0
-            )
-
-        except Exception:
-            speed = 0
-
-        if (
-            age is not None
-            and age <= 5
-            and speed >= 5
-        ):
-            real_movement = True
+        real_movement = True
 
 
     # =====================================================
@@ -794,6 +813,12 @@ def analyze_vehicle(
 
         "gps_age_minutes":
             age,
+
+        "previous_status":
+            previous_status,
+
+        "speed":
+            speed,
     }
 
 
@@ -877,6 +902,40 @@ def prepare_vehicle_data():
             state,
         )
 
+
+        # =================================================
+        # تسجيل تغير الحالة في سجل الأحداث
+        # لا نسجل أول قراءة ولا حالة checking
+        # =================================================
+        previous_status = analysis.get("previous_status")
+        current_status = analysis.get("movement_status")
+
+        if (
+            previous_status
+            and current_status != previous_status
+            and current_status != "checking"
+        ):
+            event_labels = {
+                "moving": "بدأ الحركة",
+                "stopped": "توقف",
+                "idle": "متوقف - المحرك يعمل",
+                "engine_off": "المحرك مطفأ",
+            }
+
+            record_event({
+                "vehicle": vehicle.get("name"),
+                "event": event_labels.get(current_status, current_status),
+                "status": current_status,
+                "previous_status": previous_status,
+                "time": dt or datetime.now(timezone.utc).isoformat(),
+                "speed": speed,
+                "latitude": lat,
+                "longitude": lon,
+                "location": location_name if known_location else "خارج المواقع المعروفة",
+                "nearest_location": location_name,
+                "distance_to_nearest_meters": round(distance) if distance is not None else None,
+                "stopped_duration": analysis.get("stopped_duration"),
+            })
 
         # =================================================
         # تجهيز البطاقة
@@ -1119,6 +1178,73 @@ def movement_state():
                 load_state(),
         }
     )
+
+
+# =========================================================
+# سجل الأحداث
+# =========================================================
+@app.route("/history")
+def history():
+    events = list(reversed(load_history()))
+
+    html = """
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="30">
+<title>سجل أحداث المركبات</title>
+<style>
+body { margin:0; font-family:Arial,Tahoma,sans-serif; background:#f1f5f9; color:#0f172a; }
+.header { background:#14213d; color:white; padding:28px 6%; }
+.header h1 { margin:0 0 8px 0; }
+.header p { margin:0; opacity:.85; }
+.actions { margin:20px 6%; }
+.button { display:inline-block; text-decoration:none; background:#2563eb; color:white; padding:11px 18px; border-radius:12px; font-weight:bold; }
+.table-wrap { margin:0 6% 40px 6%; background:white; border-radius:18px; overflow:auto; }
+table { width:100%; border-collapse:collapse; min-width:900px; }
+th,td { padding:13px 15px; border-bottom:1px solid #e2e8f0; text-align:right; }
+th { background:#e2e8f0; }
+.moving { color:#047857; font-weight:bold; }
+.stopped { color:#334155; font-weight:bold; }
+.idle { color:#92400e; font-weight:bold; }
+.engine_off { color:#1d4ed8; font-weight:bold; }
+.empty { padding:35px; text-align:center; color:#64748b; }
+</style>
+</head>
+<body>
+<div class="header">
+<h1>📋 سجل أحداث المركبات</h1>
+<p>يسجل تغيرات الحالة المهمة فقط — ويُحدّث كل 30 ثانية</p>
+</div>
+<div class="actions"><a class="button" href="/dashboard">العودة إلى لوحة المتابعة</a></div>
+{% if events %}
+<div class="table-wrap">
+<table>
+<thead><tr><th>المركبة</th><th>الحدث</th><th>الوقت</th><th>السرعة</th><th>الموقع</th><th>أقرب موقع</th><th>الإحداثيات</th></tr></thead>
+<tbody>
+{% for e in events %}
+<tr>
+<td><strong>{{ e.vehicle }}</strong></td>
+<td class="{{ e.status }}">{{ e.event }}</td>
+<td>{{ e.time }}</td>
+<td>{{ e.speed if e.speed is not none else "غير متوفرة" }} كم/س</td>
+<td>{{ e.location }}</td>
+<td>{{ e.nearest_location or "غير معروف" }}</td>
+<td>{{ e.latitude }}, {{ e.longitude }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% else %}
+<div class="table-wrap"><div class="empty">لا توجد أحداث مسجلة حتى الآن. سيظهر أول حدث عند تغير حالة إحدى المركبات.</div></div>
+{% endif %}
+</body>
+</html>
+"""
+    return render_template_string(html, events=events)
 
 
 # =========================================================
@@ -1521,6 +1647,9 @@ Forklift AI Agent —
 
 </div>
 
+<div style="margin: 0 6% 22px 6%;">
+<a href="/history" style="display:inline-block;text-decoration:none;background:#2563eb;color:white;padding:11px 18px;border-radius:12px;font-weight:bold;">📋 سجل الأحداث</a>
+</div>
 
 <div class="grid">
 
