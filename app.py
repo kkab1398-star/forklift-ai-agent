@@ -20,8 +20,11 @@ BASE_URL = "https://api.fm-track.com"
 # تغير الموقع المطلوب لاعتبار المركبة تحركت فعلياً
 MOVEMENT_DISTANCE_METERS = 25
 
-# بعد دقيقة واحدة بدون حركة نعتبر المركبة متوقفة
+# بعد دقيقة واحدة بدون حركة نعتبر المركبة متوقفة في لوحة المتابعة
 STOP_AFTER_MINUTES = 1
+
+# لا نغلق الرحلة إلا بعد 5 دقائق توقف متواصل
+TRIP_END_AFTER_MINUTES = 5
 
 # بعد 15 دقيقة نعرض تحذير أن GPS قديم
 # ملاحظة: هذا لا يغير حالة المركبة إلى "GPS قديم"
@@ -987,7 +990,11 @@ def prepare_vehicle_data():
         previous_status = analysis.get("previous_status")
 
         # بدء رحلة عند الانتقال إلى الحركة
-        if current_status == "moving" and previous_status != "moving":
+        if (
+            current_status == "moving"
+            and previous_status != "moving"
+            and not vehicle_state.get("trip_active")
+        ):
             vehicle_state["trip_active"] = True
             vehicle_state["trip_start_time"] = dt or now_utc_iso()
             vehicle_state["trip_start_lat"] = lat
@@ -1010,12 +1017,18 @@ def prepare_vehicle_data():
                 1,
             )
 
-        # إنهاء الرحلة بعد تأكيد التوقف
+        # إنهاء الرحلة فقط بعد 5 دقائق توقف متواصل.
+        # لوحة المتابعة تبقى سريعة وتعرض "متوقف" بعد دقيقة واحدة،
+        # لكن الرحلة تظل مفتوحة إذا عادت المركبة للحركة قبل 5 دقائق.
+        trip_stop_minutes = analysis.get("stopped_minutes")
         if (
             vehicle_state.get("trip_active")
             and current_status in ("stopped", "idle", "engine_off")
+            and trip_stop_minutes is not None
+            and trip_stop_minutes >= TRIP_END_AFTER_MINUTES
         ):
-            end_time = now_utc_iso()
+            # نهاية الرحلة هي آخر حركة مؤكدة، لا وقت اكتشاف التوقف بعد 5 دقائق.
+            end_time = analysis.get("last_movement") or now_utc_iso()
             start_time = vehicle_state.get("trip_start_time")
             duration_minutes = duration_between_minutes(start_time, end_time)
 
