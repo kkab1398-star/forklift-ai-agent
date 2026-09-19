@@ -1,6 +1,6 @@
 import os
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from math import radians, sin, cos, sqrt, atan2
 
 import requests
@@ -20,8 +20,8 @@ BASE_URL = "https://api.fm-track.com"
 # تغير الموقع المطلوب لاعتبار المركبة تحركت فعلياً
 MOVEMENT_DISTANCE_METERS = 25
 
-# بعد 5 دقائق بدون حركة نعتبر المركبة متوقفة
-STOP_AFTER_MINUTES = 5
+# بعد دقيقة واحدة بدون حركة نعتبر المركبة متوقفة
+STOP_AFTER_MINUTES = 1
 
 # بعد 15 دقيقة نعرض تحذير أن GPS قديم
 # ملاحظة: هذا لا يغير حالة المركبة إلى "GPS قديم"
@@ -31,6 +31,8 @@ STALE_GPS_MINUTES = 15
 STATE_FILE = "/tmp/forklift_vehicle_state.json"
 HISTORY_FILE = "/tmp/forklift_event_history.json"
 MAX_HISTORY_EVENTS = 1000
+TRIPS_FILE = "/tmp/forklift_trips.json"
+MAX_TRIPS = 1000
 
 
 # =========================================================
@@ -109,6 +111,21 @@ def parse_datetime(value):
 
     except Exception:
         return None
+
+
+def makkah_datetime(value):
+    """تحويل وقت UTC/ISO إلى توقيت مكة المكرمة UTC+3 للعرض فقط."""
+    dt = parse_datetime(value)
+    if dt is None:
+        return "غير معروف"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    makkah = dt.astimezone(timezone(timedelta(hours=3)))
+    return makkah.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def now_utc_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def gps_age_minutes(datetime_text):
@@ -309,6 +326,43 @@ def record_event(event):
     history = load_history()
     history.append(event)
     save_history(history)
+
+
+# =========================================================
+# سجل الرحلات المؤقت
+# =========================================================
+def load_trips():
+    try:
+        if os.path.exists(TRIPS_FILE):
+            with open(TRIPS_FILE, "r", encoding="utf-8") as file:
+                data = json.load(file)
+                if isinstance(data, list):
+                    return data
+    except Exception:
+        pass
+    return []
+
+
+def save_trips(trips):
+    try:
+        with open(TRIPS_FILE, "w", encoding="utf-8") as file:
+            json.dump(trips[-MAX_TRIPS:], file, ensure_ascii=False, indent=2)
+    except Exception as error:
+        print("Trips save error:", error)
+
+
+def record_trip(trip):
+    trips = load_trips()
+    trips.append(trip)
+    save_trips(trips)
+
+
+def duration_between_minutes(start_text, end_text):
+    start = parse_datetime(start_text)
+    end = parse_datetime(end_text)
+    if start is None or end is None:
+        return None
+    return round(max((end - start).total_seconds() / 60, 0), 1)
 
 
 # =========================================================
@@ -674,7 +728,7 @@ def analyze_vehicle(
         )
 
 
-    # لا توجد حركة لمدة 5 دقائق
+    # لا توجد حركة لمدة دقيقة واحدة
     elif (
         stopped_minutes is not None
         and stopped_minutes
@@ -704,15 +758,16 @@ def analyze_vehicle(
 
 
     # ما زلنا داخل فترة التأكد
+    # إذا كانت المركبة متحركة في القراءة السابقة نبقيها
+    # متحركة حتى تكتمل دقيقة عدم الحركة، حتى لا تتقطع الرحلة.
     else:
 
-        status_code = (
-            "checking"
-        )
-
-        status_text = (
-            "جاري التحقق من الحركة"
-        )
+        if previous_status == "moving":
+            status_code = "moving"
+            status_text = "متحرك الآن"
+        else:
+            status_code = "checking"
+            status_text = "جاري التحقق من الحركة"
 
 
     # =====================================================
@@ -782,6 +837,15 @@ def analyze_vehicle(
 
         "ignition":
             ignition,
+
+        # بيانات الرحلة النشطة - نحافظ عليها بين التحديثات
+        "trip_active": old.get("trip_active", False),
+        "trip_start_time": old.get("trip_start_time"),
+        "trip_start_lat": old.get("trip_start_lat"),
+        "trip_start_lon": old.get("trip_start_lon"),
+        "trip_start_location": old.get("trip_start_location"),
+        "trip_start_nearest": old.get("trip_start_nearest"),
+        "trip_distance_meters": old.get("trip_distance_meters", 0),
     }
 
 
@@ -912,6 +976,72 @@ def prepare_vehicle_data():
 
 
         # =================================================
+        # إدارة الرحلة النشطة
+        # =================================================
+        vehicle_name = str(vehicle.get("name") or vehicle.get("id") or "unknown")
+        vehicle_state = state.get(vehicle_name, {})
+        current_status = analysis.get("movement_status")
+        previous_status = analysis.get("previous_status")
+
+        # بدء رحلة عند الانتقال إلى الحركة
+        if current_status == "moving" and previous_status != "moving":
+            vehicle_state["trip_active"] = True
+            vehicle_state["trip_start_time"] = dt or now_utc_iso()
+            vehicle_state["trip_start_lat"] = lat
+            vehicle_state["trip_start_lon"] = lon
+            vehicle_state["trip_start_location"] = (
+                location_name if known_location else "خارج المواقع المعروفة"
+            )
+            vehicle_state["trip_start_nearest"] = location_name
+            vehicle_state["trip_distance_meters"] = 0
+
+        # جمع انتقالات GPS الحقيقية أثناء الرحلة
+        if (
+            vehicle_state.get("trip_active")
+            and analysis.get("new_gps_point")
+            and analysis.get("movement_distance", 0) >= MOVEMENT_DISTANCE_METERS
+        ):
+            vehicle_state["trip_distance_meters"] = round(
+                float(vehicle_state.get("trip_distance_meters") or 0)
+                + float(analysis.get("movement_distance") or 0),
+                1,
+            )
+
+        # إنهاء الرحلة بعد تأكيد التوقف
+        if (
+            vehicle_state.get("trip_active")
+            and current_status in ("stopped", "idle", "engine_off")
+        ):
+            end_time = now_utc_iso()
+            start_time = vehicle_state.get("trip_start_time")
+            duration_minutes = duration_between_minutes(start_time, end_time)
+
+            record_trip({
+                "vehicle": vehicle.get("name"),
+                "start_time": start_time,
+                "end_time": end_time,
+                "duration_minutes": duration_minutes,
+                "duration_text": format_duration(duration_minutes),
+                "distance_meters": round(float(vehicle_state.get("trip_distance_meters") or 0), 1),
+                "start_latitude": vehicle_state.get("trip_start_lat"),
+                "start_longitude": vehicle_state.get("trip_start_lon"),
+                "end_latitude": lat,
+                "end_longitude": lon,
+                "start_location": vehicle_state.get("trip_start_location"),
+                "start_nearest_location": vehicle_state.get("trip_start_nearest"),
+                "end_location": location_name if known_location else "خارج المواقع المعروفة",
+                "end_nearest_location": location_name,
+            })
+
+            vehicle_state["trip_active"] = False
+            vehicle_state["trip_start_time"] = None
+            vehicle_state["trip_start_lat"] = None
+            vehicle_state["trip_start_lon"] = None
+            vehicle_state["trip_start_location"] = None
+            vehicle_state["trip_start_nearest"] = None
+            vehicle_state["trip_distance_meters"] = 0
+
+        # =================================================
         # تسجيل تغير الحالة في سجل الأحداث
         # لا نسجل أول قراءة ولا حالة checking
         # =================================================
@@ -935,7 +1065,7 @@ def prepare_vehicle_data():
                 "event": event_labels.get(current_status, current_status),
                 "status": current_status,
                 "previous_status": previous_status,
-                "time": dt or datetime.now(timezone.utc).isoformat(),
+                "time": (dt if current_status == "moving" else now_utc_iso()),
                 "speed": speed,
                 "latitude": lat,
                 "longitude": lon,
@@ -967,6 +1097,9 @@ def prepare_vehicle_data():
 
                 "datetime":
                     dt,
+
+                "datetime_makkah":
+                    makkah_datetime(dt),
 
                 "gps_age_minutes":
                     analysis[
@@ -1002,6 +1135,9 @@ def prepare_vehicle_data():
                     analysis[
                         "last_movement"
                     ],
+
+                "last_movement_makkah":
+                    makkah_datetime(analysis["last_movement"]),
 
                 "stopped_minutes":
                     analysis[
@@ -1224,7 +1360,7 @@ th { background:#e2e8f0; }
 <body>
 <div class="header">
 <h1>📋 سجل أحداث المركبات</h1>
-<p>يسجل تغيرات الحالة المهمة فقط — ويُحدّث كل 30 ثانية</p>
+<p>يسجل تغيرات الحالة المهمة فقط — التوقيت: مكة المكرمة — ويُحدّث كل 30 ثانية</p>
 </div>
 <div class="actions"><a class="button" href="/dashboard">العودة إلى لوحة المتابعة</a></div>
 {% if events %}
@@ -1236,7 +1372,7 @@ th { background:#e2e8f0; }
 <tr>
 <td><strong>{{ e.vehicle }}</strong></td>
 <td class="{{ e.status }}">{{ e.event }}</td>
-<td>{{ e.time }}</td>
+<td>{{ makkah_datetime(e.time) }}</td>
 <td>{{ e.speed if e.speed is not none else "غير متوفرة" }} كم/س</td>
 <td>{{ e.location }}</td>
 <td>{{ e.nearest_location or "غير معروف" }}</td>
@@ -1252,7 +1388,75 @@ th { background:#e2e8f0; }
 </body>
 </html>
 """
-    return render_template_string(html, events=events)
+    return render_template_string(html, events=events, makkah_datetime=makkah_datetime)
+
+
+# =========================================================
+# سجل الرحلات
+# =========================================================
+@app.route("/trips")
+def trips():
+    trips_data = list(reversed(load_trips()))
+
+    html = """
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="30">
+<title>سجل الرحلات</title>
+<style>
+body { margin:0; font-family:Arial,Tahoma,sans-serif; background:#f1f5f9; color:#0f172a; }
+.header { background:#14213d; color:white; padding:28px 6%; }
+.header h1 { margin:0 0 8px 0; }
+.header p { margin:0; opacity:.85; }
+.actions { margin:20px 6%; }
+.button { display:inline-block; text-decoration:none; background:#2563eb; color:white; padding:11px 18px; border-radius:12px; font-weight:bold; margin-left:8px; }
+.table-wrap { margin:0 6% 40px 6%; background:white; border-radius:18px; overflow:auto; }
+table { width:100%; border-collapse:collapse; min-width:1150px; }
+th,td { padding:13px 15px; border-bottom:1px solid #e2e8f0; text-align:right; }
+th { background:#e2e8f0; }
+.empty { padding:35px; text-align:center; color:#64748b; }
+</style>
+</head>
+<body>
+<div class="header">
+<h1>🚚 سجل الرحلات</h1>
+<p>كل رحلة تبدأ بالحركة وتنتهي بعد تأكيد التوقف لمدة دقيقة — التوقيت: مكة المكرمة</p>
+</div>
+<div class="actions">
+<a class="button" href="/dashboard">لوحة المتابعة</a>
+<a class="button" href="/history">سجل الأحداث</a>
+</div>
+{% if trips %}
+<div class="table-wrap">
+<table>
+<thead><tr><th>المركبة</th><th>بداية الرحلة</th><th>نهاية الرحلة</th><th>المدة</th><th>المسافة التقريبية</th><th>نقطة البداية</th><th>نقطة النهاية</th><th>أقرب موقع للبداية</th><th>أقرب موقع للنهاية</th></tr></thead>
+<tbody>
+{% for t in trips %}
+<tr>
+<td><strong>{{ t.vehicle }}</strong></td>
+<td>{{ makkah_datetime(t.start_time) }}</td>
+<td>{{ makkah_datetime(t.end_time) }}</td>
+<td>{{ t.duration_text }}</td>
+<td>{% if t.distance_meters is not none %}{{ (t.distance_meters / 1000)|round(2) }} كم{% else %}غير متوفرة{% endif %}</td>
+<td>{{ t.start_location or "غير معروف" }}</td>
+<td>{{ t.end_location or "غير معروف" }}</td>
+<td>{{ t.start_nearest_location or "غير معروف" }}</td>
+<td>{{ t.end_nearest_location or "غير معروف" }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% else %}
+<div class="table-wrap"><div class="empty">لا توجد رحلة مكتملة حتى الآن. ستظهر الرحلة بعد بدء الحركة ثم تأكيد التوقف لمدة دقيقة.</div></div>
+{% endif %}
+</body>
+</html>
+"""
+    return render_template_string(html, trips=trips_data, makkah_datetime=makkah_datetime)
 
 
 # =========================================================
@@ -1634,7 +1838,7 @@ Forklift AI Agent —
 التوقف بعد:
 
 <strong>
-5 دقائق
+دقيقة واحدة
 </strong>
 
 &nbsp; | &nbsp;
@@ -1657,6 +1861,7 @@ Forklift AI Agent —
 
 <div style="margin: 0 6% 22px 6%;">
 <a href="/history" style="display:inline-block;text-decoration:none;background:#2563eb;color:white;padding:11px 18px;border-radius:12px;font-weight:bold;">📋 سجل الأحداث</a>
+<a href="/trips" style="display:inline-block;text-decoration:none;background:#0f766e;color:white;padding:11px 18px;border-radius:12px;font-weight:bold;margin-right:8px;">🚚 الرحلات</a>
 </div>
 
 <div class="grid">
@@ -1785,7 +1990,7 @@ class="gps-box {{ v.gps_status }}"
 
 <span class="value">
 
-{{ v.last_movement or "غير معروفة" }}
+{{ v.last_movement_makkah or "غير معروفة" }}
 
 </span>
 
@@ -1970,7 +2175,7 @@ class="value warning-text"
 
 <span class="value">
 
-{{ v.datetime or "غير متوفر" }}
+{{ v.datetime_makkah or "غير متوفر" }}
 
 </span>
 
