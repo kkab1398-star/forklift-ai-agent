@@ -877,6 +877,9 @@ def analyze_vehicle(
                 stopped_minutes
             ),
 
+        "stopped_since":
+            (last_movement if status_code in ("stopped", "idle", "engine_off") else None),
+
         "movement_distance":
             movement_distance,
 
@@ -1148,6 +1151,12 @@ def prepare_vehicle_data():
                     analysis[
                         "stopped_duration"
                     ],
+
+                "stopped_since":
+                    analysis.get("stopped_since"),
+
+                "stopped_since_makkah":
+                    (makkah_datetime(analysis.get("stopped_since")) if analysis.get("stopped_since") else None),
 
                 "movement_distance":
                     analysis[
@@ -1457,6 +1466,109 @@ th { background:#e2e8f0; }
 </html>
 """
     return render_template_string(html, trips=trips_data, makkah_datetime=makkah_datetime)
+
+
+# =========================================================
+# التقرير اليومي
+# =========================================================
+@app.route("/daily-report")
+def daily_report():
+    # تحديث الحالة أولاً حتى تكون بيانات اليوم والحالة الحالية حديثة
+    try:
+        vehicles = prepare_vehicle_data()
+    except Exception:
+        vehicles = []
+
+    makkah_tz = timezone(timedelta(hours=3))
+    today = datetime.now(makkah_tz).date()
+    events = load_history()
+    trips_data = load_trips()
+
+    def is_today(value):
+        dt = parse_datetime(value)
+        if dt is None:
+            return False
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(makkah_tz).date() == today
+
+    names = []
+    for v in vehicles:
+        if v.get("name") and v.get("name") not in names:
+            names.append(v.get("name"))
+    for e in events:
+        if e.get("vehicle") and e.get("vehicle") not in names:
+            names.append(e.get("vehicle"))
+    for t in trips_data:
+        if t.get("vehicle") and t.get("vehicle") not in names:
+            names.append(t.get("vehicle"))
+
+    reports = []
+    for name in names:
+        ve = [e for e in events if e.get("vehicle") == name and is_today(e.get("time"))]
+        vt = [t for t in trips_data if t.get("vehicle") == name and is_today(t.get("end_time") or t.get("start_time"))]
+        current = next((v for v in vehicles if v.get("name") == name), {})
+
+        movement_events = [e for e in ve if e.get("status") == "moving"]
+        first_move = movement_events[0].get("time") if movement_events else None
+        last_move = movement_events[-1].get("time") if movement_events else None
+        total_distance = sum(float(t.get("distance_meters") or 0) for t in vt)
+        total_move_minutes = sum(float(t.get("duration_minutes") or 0) for t in vt)
+
+        # إجمالي فترات التوقف المسجلة اليوم تقريبياً من انتقالات الحالة
+        ordered = sorted(ve, key=lambda e: parse_datetime(e.get("time")) or datetime.min.replace(tzinfo=timezone.utc))
+        stop_minutes = 0.0
+        stop_start = None
+        for e in ordered:
+            status = e.get("status")
+            event_time = e.get("time")
+            if status in ("stopped", "idle", "engine_off") and stop_start is None:
+                stop_start = event_time
+            elif status == "moving" and stop_start:
+                stop_minutes += duration_between_minutes(stop_start, event_time) or 0
+                stop_start = None
+        if stop_start:
+            stop_minutes += minutes_since(stop_start) or 0
+
+        reports.append({
+            "name": name,
+            "status": current.get("movement_text", "غير معروف"),
+            "trips_count": len(vt),
+            "distance_km": round(total_distance / 1000, 2),
+            "movement_duration": format_duration(total_move_minutes),
+            "stop_duration": format_duration(stop_minutes),
+            "first_move": makkah_datetime(first_move) if first_move else "لا توجد حركة مسجلة",
+            "last_move": makkah_datetime(last_move) if last_move else "لا توجد حركة مسجلة",
+            "stopped_since": current.get("stopped_since_makkah") or "—",
+            "current_stop_duration": current.get("stopped_duration", "—") if current.get("movement_status") in ("stopped", "idle", "engine_off") else "—",
+        })
+
+    html = """
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta http-equiv="refresh" content="30">
+<title>التقرير اليومي</title>
+<style>
+body{margin:0;font-family:Arial,Tahoma,sans-serif;background:#f1f5f9;color:#0f172a}.header{background:#14213d;color:#fff;padding:28px 6%}.header h1{margin:0 0 8px}.actions{margin:20px 6%}.button{display:inline-block;text-decoration:none;background:#2563eb;color:#fff;padding:11px 18px;border-radius:12px;font-weight:bold;margin-left:8px}.grid{margin:0 6% 40px;display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:20px}.card{background:#fff;border-radius:18px;padding:22px;border-top:5px solid #0f766e}.name{font-size:27px;font-weight:bold;margin-bottom:14px}.row{display:flex;justify-content:space-between;gap:20px;border-bottom:1px solid #e2e8f0;padding:11px 0}.label{color:#64748b}.value{font-weight:bold;text-align:left}.note{margin:0 6% 20px;color:#64748b}
+</style></head><body>
+<div class="header"><h1>📊 التقرير اليومي</h1><div>تقرير {{ today }} — توقيت مكة المكرمة — تحديث كل 30 ثانية</div></div>
+<div class="actions"><a class="button" href="/dashboard">لوحة المتابعة</a><a class="button" href="/history">سجل الأحداث</a><a class="button" href="/trips">الرحلات</a></div>
+<div class="note">ملاحظة: البيانات مؤقتة حالياً على Render وتبدأ من آخر تشغيل للخدمة إلى أن ننقل التخزين لقاعدة البيانات الدائمة.</div>
+<div class="grid">{% for r in reports %}<div class="card"><div class="name">{{ r.name }}</div>
+<div class="row"><span class="label">الحالة الحالية</span><span class="value">{{ r.status }}</span></div>
+<div class="row"><span class="label">عدد الرحلات المكتملة اليوم</span><span class="value">{{ r.trips_count }}</span></div>
+<div class="row"><span class="label">إجمالي المسافة</span><span class="value">{{ r.distance_km }} كم</span></div>
+<div class="row"><span class="label">إجمالي زمن الرحلات المكتملة</span><span class="value">{{ r.movement_duration }}</span></div>
+<div class="row"><span class="label">إجمالي التوقف المسجل</span><span class="value">{{ r.stop_duration }}</span></div>
+<div class="row"><span class="label">أول حركة اليوم</span><span class="value">{{ r.first_move }}</span></div>
+<div class="row"><span class="label">آخر حركة اليوم</span><span class="value">{{ r.last_move }}</span></div>
+<div class="row"><span class="label">متوقف منذ</span><span class="value">{{ r.stopped_since }}</span></div>
+<div class="row"><span class="label">مدة التوقف الحالية</span><span class="value">{{ r.current_stop_duration }}</span></div>
+</div>{% endfor %}</div></body></html>
+"""
+    return render_template_string(html, reports=reports, today=today.strftime("%Y-%m-%d"))
 
 
 # =========================================================
@@ -1862,6 +1974,7 @@ Forklift AI Agent —
 <div style="margin: 0 6% 22px 6%;">
 <a href="/history" style="display:inline-block;text-decoration:none;background:#2563eb;color:white;padding:11px 18px;border-radius:12px;font-weight:bold;">📋 سجل الأحداث</a>
 <a href="/trips" style="display:inline-block;text-decoration:none;background:#0f766e;color:white;padding:11px 18px;border-radius:12px;font-weight:bold;margin-right:8px;">🚚 الرحلات</a>
+<a href="/daily-report" style="display:inline-block;text-decoration:none;background:#7c3aed;color:white;padding:11px 18px;border-radius:12px;font-weight:bold;margin-right:8px;">📊 التقرير اليومي</a>
 </div>
 
 <div class="grid">
@@ -2015,6 +2128,17 @@ class="gps-box {{ v.gps_status }}"
 
 </span>
 
+</div>
+
+<div class="row">
+<span class="label">متوقف منذ</span>
+<span class="value">
+{% if v.movement_status in ["stopped", "idle", "engine_off"] %}
+{{ v.stopped_since_makkah or "غير معروف" }}
+{% else %}
+—
+{% endif %}
+</span>
 </div>
 
 
