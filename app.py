@@ -26,6 +26,13 @@ STOP_AFTER_MINUTES = 1
 # لا نغلق الرحلة إلا بعد 5 دقائق توقف متواصل
 TRIP_END_AFTER_MINUTES = 5
 
+# Trip Engine V2
+TRIP_SPEED_THRESHOLD_KMH = 5
+TRIP_START_CONFIRM_SAMPLES = 2
+TRIP_JITTER_DISTANCE_METERS = 15
+TRIP_MAX_PLAUSIBLE_SPEED_KMH = 180
+TRIP_GPS_LOST_MINUTES = 4
+
 # بعد 15 دقيقة نعرض تحذير أن GPS قديم
 # ملاحظة: هذا لا يغير حالة المركبة إلى "GPS قديم"
 STALE_GPS_MINUTES = 15
@@ -849,6 +856,23 @@ def analyze_vehicle(
         "trip_start_location": old.get("trip_start_location"),
         "trip_start_nearest": old.get("trip_start_nearest"),
         "trip_distance_meters": old.get("trip_distance_meters", 0),
+
+        # Trip Engine V2 state
+        "trip_engine_state": old.get("trip_engine_state", "STOPPED"),
+        "trip_start_confirm_count": old.get("trip_start_confirm_count", 0),
+        "trip_candidate_time": old.get("trip_candidate_time"),
+        "trip_candidate_lat": old.get("trip_candidate_lat"),
+        "trip_candidate_lon": old.get("trip_candidate_lon"),
+        "trip_candidate_location": old.get("trip_candidate_location"),
+        "trip_candidate_nearest": old.get("trip_candidate_nearest"),
+        "trip_stopping_since": old.get("trip_stopping_since"),
+        "trip_last_point_time": old.get("trip_last_point_time"),
+        "trip_last_point_lat": old.get("trip_last_point_lat"),
+        "trip_last_point_lon": old.get("trip_last_point_lon"),
+        "trip_last_moving_time": old.get("trip_last_moving_time"),
+        "trip_last_moving_lat": old.get("trip_last_moving_lat"),
+        "trip_last_moving_lon": old.get("trip_last_moving_lon"),
+        "trip_max_speed_kmh": old.get("trip_max_speed_kmh", 0),
     }
 
 
@@ -982,80 +1006,176 @@ def prepare_vehicle_data():
 
 
         # =================================================
-        # إدارة الرحلة النشطة
+        # Trip Engine V2 - محرك الرحلات المستقل عن الداشبورد
         # =================================================
         vehicle_name = str(vehicle.get("name") or vehicle.get("id") or "unknown")
         vehicle_state = state.get(vehicle_name, {})
-        current_status = analysis.get("movement_status")
-        previous_status = analysis.get("previous_status")
 
-        # بدء رحلة عند الانتقال إلى الحركة
-        if (
-            current_status == "moving"
-            and previous_status != "moving"
-            and not vehicle_state.get("trip_active")
-        ):
-            vehicle_state["trip_active"] = True
-            vehicle_state["trip_start_time"] = dt or now_utc_iso()
-            vehicle_state["trip_start_lat"] = lat
-            vehicle_state["trip_start_lon"] = lon
-            vehicle_state["trip_start_location"] = (
-                location_name if known_location else "خارج المواقع المعروفة"
+        engine_state = vehicle_state.get("trip_engine_state", "STOPPED")
+        new_point = bool(analysis.get("new_gps_point"))
+        gps_age = analysis.get("gps_age_minutes")
+        point_time = dt
+        point_speed = float(analysis.get("speed") or 0)
+        point_distance = float(analysis.get("movement_distance") or 0)
+
+        # لا نعالج نفس نقطة الجهاز أكثر من مرة.
+        last_trip_point_time = vehicle_state.get("trip_last_point_time")
+        process_trip_point = bool(new_point and point_time and point_time != last_trip_point_time)
+
+        if process_trip_point:
+            current_dt = parse_datetime(point_time)
+            previous_dt = parse_datetime(last_trip_point_time)
+
+            # فحص القفزات غير المنطقية قبل إدخال النقطة في حساب المسافة.
+            plausible_point = True
+            implied_speed = None
+            if previous_dt and current_dt and point_distance > 0:
+                dt_seconds = (current_dt - previous_dt).total_seconds()
+                if dt_seconds <= 0:
+                    plausible_point = False
+                else:
+                    implied_speed = (point_distance / 1000.0) / (dt_seconds / 3600.0)
+                    if implied_speed > TRIP_MAX_PLAUSIBLE_SPEED_KMH:
+                        plausible_point = False
+
+            fresh_speed_signal = (
+                gps_age is not None
+                and gps_age <= 5
+                and point_speed >= TRIP_SPEED_THRESHOLD_KMH
             )
-            vehicle_state["trip_start_nearest"] = location_name
-            vehicle_state["trip_distance_meters"] = 0
+            spatial_signal = (
+                plausible_point
+                and point_distance >= TRIP_JITTER_DISTANCE_METERS
+            )
+            moving_sample = fresh_speed_signal or spatial_signal
 
-        # جمع انتقالات GPS الحقيقية أثناء الرحلة
+            # GPS قديم لا يعني توقفاً. نعلّق الرحلة ولا نغلقها.
+            if gps_age is not None and gps_age >= TRIP_GPS_LOST_MINUTES:
+                if engine_state in ("MOVING", "STOPPING"):
+                    engine_state = "GPS_LOST"
+            else:
+                if engine_state == "GPS_LOST":
+                    # عند عودة GPS نكمل الرحلة نفسها.
+                    engine_state = "MOVING" if vehicle_state.get("trip_active") else "STOPPED"
+
+                if engine_state == "STOPPED":
+                    if moving_sample:
+                        engine_state = "STARTING"
+                        vehicle_state["trip_start_confirm_count"] = 1
+                        # نحفظ أول نقطة مرشحة حتى لا نفقد بداية الرحلة.
+                        vehicle_state["trip_candidate_time"] = point_time
+                        vehicle_state["trip_candidate_lat"] = lat
+                        vehicle_state["trip_candidate_lon"] = lon
+                        vehicle_state["trip_candidate_location"] = (
+                            location_name if known_location else "خارج المواقع المعروفة"
+                        )
+                        vehicle_state["trip_candidate_nearest"] = location_name
+
+                elif engine_state == "STARTING":
+                    if moving_sample:
+                        count = int(vehicle_state.get("trip_start_confirm_count") or 0) + 1
+                        vehicle_state["trip_start_confirm_count"] = count
+                        if count >= TRIP_START_CONFIRM_SAMPLES:
+                            vehicle_state["trip_active"] = True
+                            vehicle_state["trip_start_time"] = (
+                                vehicle_state.get("trip_candidate_time") or point_time or now_utc_iso()
+                            )
+                            vehicle_state["trip_start_lat"] = vehicle_state.get("trip_candidate_lat")
+                            vehicle_state["trip_start_lon"] = vehicle_state.get("trip_candidate_lon")
+                            vehicle_state["trip_start_location"] = vehicle_state.get("trip_candidate_location")
+                            vehicle_state["trip_start_nearest"] = vehicle_state.get("trip_candidate_nearest")
+                            vehicle_state["trip_distance_meters"] = 0
+                            vehicle_state["trip_max_speed_kmh"] = point_speed
+                            vehicle_state["trip_stopping_since"] = None
+                            engine_state = "MOVING"
+                    else:
+                        # فشل تأكيد البداية: كانت قراءة عابرة أو jitter.
+                        engine_state = "STOPPED"
+                        vehicle_state["trip_start_confirm_count"] = 0
+                        vehicle_state["trip_candidate_time"] = None
+
+                elif engine_state == "MOVING":
+                    if moving_sample:
+                        vehicle_state["trip_last_moving_time"] = point_time
+                        vehicle_state["trip_last_moving_lat"] = lat
+                        vehicle_state["trip_last_moving_lon"] = lon
+                    else:
+                        engine_state = "STOPPING"
+                        vehicle_state["trip_stopping_since"] = point_time
+
+                elif engine_state == "STOPPING":
+                    if moving_sample:
+                        # توقف قصير: نفس الرحلة تستمر بلا تقطيع.
+                        engine_state = "MOVING"
+                        vehicle_state["trip_stopping_since"] = None
+                        vehicle_state["trip_last_moving_time"] = point_time
+                        vehicle_state["trip_last_moving_lat"] = lat
+                        vehicle_state["trip_last_moving_lon"] = lon
+                    else:
+                        stop_since = parse_datetime(vehicle_state.get("trip_stopping_since"))
+                        if stop_since and current_dt:
+                            stopped_for = (current_dt - stop_since).total_seconds() / 60.0
+                            if stopped_for >= TRIP_END_AFTER_MINUTES and vehicle_state.get("trip_active"):
+                                # نغلق الرحلة عند بداية التوقف المؤكد، لا بعد انتظار 5 دقائق.
+                                end_time = vehicle_state.get("trip_stopping_since") or point_time
+                                start_time = vehicle_state.get("trip_start_time")
+                                duration_minutes = duration_between_minutes(start_time, end_time)
+
+                                record_trip({
+                                    "vehicle": vehicle.get("name"),
+                                    "start_time": start_time,
+                                    "end_time": end_time,
+                                    "duration_minutes": duration_minutes,
+                                    "duration_text": format_duration(duration_minutes),
+                                    "distance_meters": round(float(vehicle_state.get("trip_distance_meters") or 0), 1),
+                                    "max_speed_kmh": round(float(vehicle_state.get("trip_max_speed_kmh") or 0), 1),
+                                    "start_latitude": vehicle_state.get("trip_start_lat"),
+                                    "start_longitude": vehicle_state.get("trip_start_lon"),
+                                    "end_latitude": vehicle_state.get("trip_last_moving_lat") or lat,
+                                    "end_longitude": vehicle_state.get("trip_last_moving_lon") or lon,
+                                    "start_location": vehicle_state.get("trip_start_location"),
+                                    "start_nearest_location": vehicle_state.get("trip_start_nearest"),
+                                    "end_location": location_name if known_location else "خارج المواقع المعروفة",
+                                    "end_nearest_location": location_name,
+                                })
+
+                                vehicle_state["trip_active"] = False
+                                vehicle_state["trip_start_time"] = None
+                                vehicle_state["trip_start_lat"] = None
+                                vehicle_state["trip_start_lon"] = None
+                                vehicle_state["trip_start_location"] = None
+                                vehicle_state["trip_start_nearest"] = None
+                                vehicle_state["trip_distance_meters"] = 0
+                                vehicle_state["trip_max_speed_kmh"] = 0
+                                vehicle_state["trip_stopping_since"] = None
+                                vehicle_state["trip_start_confirm_count"] = 0
+                                engine_state = "STOPPED"
+
+            # حساب المسافة فقط للنقاط المقبولة داخل رحلة مفتوحة.
+            # أثناء STOPPING لا نضيف jitter؛ وإذا عادت الحركة نكمل من النقطة الجديدة.
+            if vehicle_state.get("trip_active") and plausible_point:
+                if engine_state == "MOVING" and point_distance >= TRIP_JITTER_DISTANCE_METERS:
+                    vehicle_state["trip_distance_meters"] = round(
+                        float(vehicle_state.get("trip_distance_meters") or 0) + point_distance, 1
+                    )
+                vehicle_state["trip_max_speed_kmh"] = max(
+                    float(vehicle_state.get("trip_max_speed_kmh") or 0),
+                    point_speed if fresh_speed_signal else 0,
+                )
+
+            vehicle_state["trip_last_point_time"] = point_time
+            vehicle_state["trip_last_point_lat"] = lat
+            vehicle_state["trip_last_point_lon"] = lon
+
+        # إذا لا تصل نقطة جديدة لفترة طويلة، لا نغلق الرحلة بسبب الصمت.
         if (
             vehicle_state.get("trip_active")
-            and analysis.get("new_gps_point")
-            and analysis.get("movement_distance", 0) >= MOVEMENT_DISTANCE_METERS
+            and analysis.get("gps_age_minutes") is not None
+            and analysis.get("gps_age_minutes") >= TRIP_GPS_LOST_MINUTES
         ):
-            vehicle_state["trip_distance_meters"] = round(
-                float(vehicle_state.get("trip_distance_meters") or 0)
-                + float(analysis.get("movement_distance") or 0),
-                1,
-            )
+            engine_state = "GPS_LOST"
 
-        # إنهاء الرحلة فقط بعد 5 دقائق توقف متواصل.
-        # لوحة المتابعة تبقى سريعة وتعرض "متوقف" بعد دقيقة واحدة،
-        # لكن الرحلة تظل مفتوحة إذا عادت المركبة للحركة قبل 5 دقائق.
-        trip_stop_minutes = analysis.get("stopped_minutes")
-        if (
-            vehicle_state.get("trip_active")
-            and current_status in ("stopped", "idle", "engine_off")
-            and trip_stop_minutes is not None
-            and trip_stop_minutes >= TRIP_END_AFTER_MINUTES
-        ):
-            # نهاية الرحلة هي آخر حركة مؤكدة، لا وقت اكتشاف التوقف بعد 5 دقائق.
-            end_time = analysis.get("last_movement") or now_utc_iso()
-            start_time = vehicle_state.get("trip_start_time")
-            duration_minutes = duration_between_minutes(start_time, end_time)
-
-            record_trip({
-                "vehicle": vehicle.get("name"),
-                "start_time": start_time,
-                "end_time": end_time,
-                "duration_minutes": duration_minutes,
-                "duration_text": format_duration(duration_minutes),
-                "distance_meters": round(float(vehicle_state.get("trip_distance_meters") or 0), 1),
-                "start_latitude": vehicle_state.get("trip_start_lat"),
-                "start_longitude": vehicle_state.get("trip_start_lon"),
-                "end_latitude": lat,
-                "end_longitude": lon,
-                "start_location": vehicle_state.get("trip_start_location"),
-                "start_nearest_location": vehicle_state.get("trip_start_nearest"),
-                "end_location": location_name if known_location else "خارج المواقع المعروفة",
-                "end_nearest_location": location_name,
-            })
-
-            vehicle_state["trip_active"] = False
-            vehicle_state["trip_start_time"] = None
-            vehicle_state["trip_start_lat"] = None
-            vehicle_state["trip_start_lon"] = None
-            vehicle_state["trip_start_location"] = None
-            vehicle_state["trip_start_nearest"] = None
-            vehicle_state["trip_distance_meters"] = 0
+        vehicle_state["trip_engine_state"] = engine_state
 
         # =================================================
         # تسجيل تغير الحالة في سجل الأحداث
@@ -1445,7 +1565,7 @@ th { background:#e2e8f0; }
 <body>
 <div class="header">
 <h1>🚚 سجل الرحلات</h1>
-<p>كل رحلة تبدأ بالحركة وتنتهي بعد تأكيد التوقف لمدة دقيقة — التوقيت: مكة المكرمة</p>
+<p>كل رحلة تبدأ بعد تأكيد الحركة وتنتهي بعد 5 دقائق توقف متواصل — التوقيت: مكة المكرمة</p>
 </div>
 <div class="actions">
 <a class="button" href="/dashboard">لوحة المتابعة</a>
@@ -1473,7 +1593,7 @@ th { background:#e2e8f0; }
 </table>
 </div>
 {% else %}
-<div class="table-wrap"><div class="empty">لا توجد رحلة مكتملة حتى الآن. ستظهر الرحلة بعد بدء الحركة ثم تأكيد التوقف لمدة دقيقة.</div></div>
+<div class="table-wrap"><div class="empty">لا توجد رحلة مكتملة حتى الآن. ستظهر الرحلة بعد تأكيد بدء الحركة ثم 5 دقائق توقف متواصل.</div></div>
 {% endif %}
 </body>
 </html>
