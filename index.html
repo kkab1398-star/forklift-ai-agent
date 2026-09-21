@@ -1,80 +1,709 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>مركز متابعة السائقين</title>
-<style>
-*{box-sizing:border-box}body{margin:0;background:#f1f5f9;color:#0f172a;font-family:Tahoma,Arial,sans-serif}
-header{background:#0f172a;color:#fff;padding:26px 5%}header h1{margin:0 0 6px;font-size:30px}header p{margin:0;color:#cbd5e1}
-main{width:92%;max-width:1400px;margin:24px auto}.summary,.grid{display:grid;gap:16px}.summary{grid-template-columns:repeat(4,1fr);margin-bottom:20px}
-.box,.card{background:#fff;border-radius:18px;padding:18px;box-shadow:0 4px 16px #0f172a12}.num{font-size:30px;font-weight:800;margin-top:7px}.muted{color:#64748b}
-.grid{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}.top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
-.name{font-size:28px;font-weight:800}.pill{display:inline-block;margin-top:8px;padding:8px 12px;border-radius:999px;font-weight:700;font-size:14px}
-.moving,.working{background:#dcfce7;color:#047857}.stopped{background:#e2e8f0;color:#334155}.starting{background:#ede9fe;color:#6d28d9}
-.stopping{background:#fef3c7;color:#92400e}.gpslost{background:#fee2e2;color:#b91c1c}.nonwork{background:#dbeafe;color:#1d4ed8}.unknown{background:#f1f5f9;color:#475569}
-.location{margin-top:17px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:14px;padding:15px}.location b{font-size:19px}
-.row{display:flex;justify-content:space-between;gap:18px;padding:11px 0;border-bottom:1px solid #e2e8f0}.row span{color:#64748b}.row strong{text-align:left}
-.warn{color:#b91c1c}.footer{text-align:center;color:#64748b;padding:25px}.error{background:#fee2e2;color:#991b1b;padding:18px;border-radius:14px}
-@media(max-width:720px){.summary{grid-template-columns:repeat(2,1fr)}.top{display:block}}
-</style>
-</head>
-<body>
-<header><h1>مركز متابعة السائقين</h1><p>Forklift AI Agent — البيانات مباشرة من Supabase</p></header>
-<main>
-<div id="status" class="muted">جاري تحميل البيانات…</div>
-<div id="summary" class="summary"></div>
-<div id="grid" class="grid"></div>
-</main>
-<div class="footer">تحديث تلقائي كل 30 ثانية — توقيت مكة المكرمة</div>
-<script>
-const API="https://zwadkjczawezdohhcrmav.supabase.co/functions/v1/fleet-dashboard";
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
-const fmt=t=>t?new Intl.DateTimeFormat("ar-SA",{timeZone:"Asia/Riyadh",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}).format(new Date(t)):"—";
-const duration=t=>{if(!t)return"—";let m=Math.max(0,Math.floor((Date.now()-new Date(t))/60000));return m<60?`${m} دقيقة`:`${Math.floor(m/60)} ساعة${m%60?` و ${m%60} دقيقة`:""}`};
-function stateInfo(s){
-  return ({MOVING:["🟢","متحرك","moving"],STARTING:["🟣","جاري تأكيد الحركة","starting"],STOPPING:["🟡","جاري تأكيد التوقف","stopping"],STOPPED:["⚪","متوقف","stopped"],GPS_LOST:["⚠️","فقد GPS","gpslost"]})[s]||["❔","غير معروف","unknown"];
-}
-async function load(){
-  const status=document.getElementById("status");
-  try{
-    const r=await fetch(API,{cache:"no-store"});
-    if(!r.ok) throw new Error(`HTTP ${r.status}`);
-    const d=await r.json();
-    if(!d.ok) throw new Error(d.error||"API error");
-    const vs=d.vehicles||[];
-    const moving=vs.filter(v=>v.state==="MOVING").length;
-    const working=vs.filter(v=>v.work_status==="WORKING").length;
-    const nonwork=vs.filter(v=>v.work_status==="NON_WORK_LOCATION").length;
-    document.getElementById("summary").innerHTML=[
-      ["إجمالي المركبات",vs.length],["متحركة الآن",moving],["رحلات عمل جارية",working],["داخل مواقع غير محسوبة",nonwork]
-    ].map(x=>`<div class="box"><div class="muted">${x[0]}</div><div class="num">${x[1]}</div></div>`).join("");
-    document.getElementById("grid").innerHTML=vs.map(v=>{
-      const [icon,label,cls]=stateInfo(v.state);
-      const work=v.work_status==="WORKING"?"رحلة عمل جارية":v.work_status==="NON_WORK_LOCATION"?"غير محسوب كعمل":"لا توجد رحلة عمل جارية";
-      const wcls=v.work_status==="WORKING"?"working":v.work_status==="NON_WORK_LOCATION"?"nonwork":"stopped";
-      const place=v.inside_non_work_location?(v.location_name||"موقع مستثنى"):"خارج المواقع المستثناة";
-      const trip=v.current_trip;
-      return `<section class="card">
-        <div class="top"><div><div class="name">${esc(v.name)}</div><div class="pill ${cls}">${icon} ${label}</div></div><div class="pill ${wcls}">${work}</div></div>
-        <div class="location"><div class="muted">📍 الموقع الحالي</div><b>${esc(place)}</b>${v.nearest_location_distance_m!=null?`<div class="muted">أقرب موقع مسجل: ${esc(v.nearest_location_name)} — ${esc(v.nearest_location_distance_m)} متر</div>`:""}</div>
-        <div class="row"><span>آخر سرعة مسجلة</span><strong>${esc(v.speed_kmh)} كم/س</strong></div>
-        <div class="row"><span>حالة العمل</span><strong>${work}</strong></div>
-        <div class="row"><span>آخر GPS</span><strong>${fmt(v.last_device_time)}</strong></div>
-        <div class="row"><span>عمر GPS</span><strong class="${v.gps_stale?"warn":""}">${v.gps_age_minutes==null?"غير معروف":esc(v.gps_age_minutes)+" دقيقة"}${v.gps_stale?" ⚠️":""}</strong></div>
-        <div class="row"><span>بداية الرحلة الحالية</span><strong>${trip?fmt(trip.started_at):"—"}</strong></div>
-        <div class="row"><span>مدة الرحلة الحالية</span><strong>${trip?duration(trip.started_at):"—"}</strong></div>
-        <div class="row"><span>مسافة الرحلة الحالية</span><strong>${trip?(Number(trip.distance_meters||0)/1000).toFixed(2)+" كم":"—"}</strong></div>
-        <div class="row"><span>الإحداثيات</span><strong>${v.latitude==null?"—":esc(v.latitude)+", "+esc(v.longitude)}</strong></div>
-      </section>`;
-    }).join("");
-    status.textContent=`آخر تحديث للوحة: ${fmt(d.generated_at)}`;
-  }catch(e){
-    status.innerHTML=`<div class="error">تعذر تحميل البيانات: ${esc(e.message)}</div>`;
+  <title>مركز متابعة السائقين</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Tahoma, Arial, sans-serif;
+      background: #f1f5f9;
+      color: #0f172a;
+    }
+
+    .header {
+      background: #0f172a;
+      color: white;
+      padding: 28px 5%;
+    }
+
+    .header h1 {
+      margin: 0 0 7px;
+      font-size: 30px;
+    }
+
+    .header p {
+      margin: 0;
+      color: #cbd5e1;
+    }
+
+    .container {
+      width: 92%;
+      max-width: 1400px;
+      margin: 25px auto 50px;
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+      margin-bottom: 22px;
+    }
+
+    .summary-box {
+      background: white;
+      border-radius: 17px;
+      padding: 18px;
+      box-shadow: 0 3px 14px rgba(15, 23, 42, 0.06);
+    }
+
+    .summary-number {
+      font-size: 29px;
+      font-weight: bold;
+      margin-top: 7px;
+    }
+
+    .summary-label {
+      color: #64748b;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(370px, 1fr));
+      gap: 20px;
+    }
+
+    .card {
+      background: white;
+      border-radius: 20px;
+      padding: 22px;
+      box-shadow: 0 5px 18px rgba(15, 23, 42, 0.07);
+    }
+
+    .card-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 15px;
+      align-items: flex-start;
+    }
+
+    .vehicle-name {
+      font-size: 29px;
+      font-weight: 800;
+      margin-bottom: 10px;
+    }
+
+    .badge,
+    .work {
+      display: inline-block;
+      border-radius: 30px;
+      padding: 8px 13px;
+      font-weight: bold;
+      font-size: 14px;
+    }
+
+    .moving {
+      background: #dcfce7;
+      color: #047857;
+    }
+
+    .stopped {
+      background: #e2e8f0;
+      color: #334155;
+    }
+
+    .starting {
+      background: #ede9fe;
+      color: #6d28d9;
+    }
+
+    .stopping {
+      background: #fef3c7;
+      color: #92400e;
+    }
+
+    .gpslost {
+      background: #fee2e2;
+      color: #b91c1c;
+    }
+
+    .unknown {
+      background: #f1f5f9;
+      color: #475569;
+    }
+
+    .working {
+      background: #dcfce7;
+      color: #047857;
+    }
+
+    .nonwork {
+      background: #dbeafe;
+      color: #1d4ed8;
+    }
+
+    .notworking {
+      background: #f1f5f9;
+      color: #475569;
+    }
+
+    .location {
+      margin-top: 18px;
+      padding: 16px;
+      border-radius: 15px;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+    }
+
+    .location-title {
+      color: #64748b;
+      font-size: 13px;
+      margin-bottom: 5px;
+    }
+
+    .location-name {
+      font-size: 20px;
+      font-weight: bold;
+    }
+
+    .small {
+      margin-top: 5px;
+      color: #64748b;
+      font-size: 13px;
+    }
+
+    .rows {
+      margin-top: 14px;
+    }
+
+    .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 11px 0;
+      border-bottom: 1px solid #e2e8f0;
+    }
+
+    .row span {
+      color: #64748b;
+    }
+
+    .row strong {
+      text-align: left;
+    }
+
+    .error {
+      background: #fee2e2;
+      color: #b91c1c;
+      padding: 17px;
+      border-radius: 15px;
+      margin-bottom: 20px;
+      display: none;
+    }
+
+    .loading {
+      background: white;
+      padding: 25px;
+      border-radius: 18px;
+      text-align: center;
+      color: #64748b;
+    }
+
+    .gps-warning {
+      margin-top: 15px;
+      padding: 12px;
+      border-radius: 12px;
+      background: #fff7ed;
+      color: #c2410c;
+      font-weight: bold;
+    }
+
+    .footer {
+      color: #64748b;
+      text-align: center;
+      padding: 25px;
+    }
+
+    @media (max-width: 750px) {
+      .summary {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .card-top {
+        display: block;
+      }
+
+      .work {
+        margin-top: 8px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+<header class="header">
+  <h1>مركز متابعة السائقين</h1>
+  <p>Forklift AI Agent — البيانات مباشرة من Supabase</p>
+</header>
+
+<main class="container">
+
+  <div id="errorBox" class="error"></div>
+
+  <div class="summary">
+    <div class="summary-box">
+      <div class="summary-label">إجمالي المركبات</div>
+      <div class="summary-number" id="totalVehicles">—</div>
+    </div>
+
+    <div class="summary-box">
+      <div class="summary-label">متحركة الآن</div>
+      <div class="summary-number" id="movingVehicles">—</div>
+    </div>
+
+    <div class="summary-box">
+      <div class="summary-label">رحلات عمل جارية</div>
+      <div class="summary-number" id="workingVehicles">—</div>
+    </div>
+
+    <div class="summary-box">
+      <div class="summary-label">داخل مواقع غير محسوبة</div>
+      <div class="summary-number" id="nonWorkVehicles">—</div>
+    </div>
+  </div>
+
+  <div id="vehicleGrid" class="grid">
+    <div class="loading">جاري تحميل بيانات المركبات...</div>
+  </div>
+
+</main>
+
+<div class="footer">
+  تحديث تلقائي كل 30 ثانية — توقيت مكة المكرمة
+</div>
+
+<script>
+  const API_URL =
+    "https://zwadkjczawezdohrcmav.supabase.co/functions/v1/fleet-dashboard";
+
+  function escapeHtml(value) {
+    if (value === null || value === undefined) return "";
+
+    return String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
   }
-}
-load(); setInterval(load,30000);
+
+  function stateInfo(state) {
+    const value = String(state || "UNKNOWN").toUpperCase();
+
+    if (value === "MOVING") {
+      return {
+        text: "🟢 متحرك",
+        className: "moving"
+      };
+    }
+
+    if (value === "STOPPED") {
+      return {
+        text: "⚪ متوقف",
+        className: "stopped"
+      };
+    }
+
+    if (value === "STARTING") {
+      return {
+        text: "🟣 جاري تأكيد الحركة",
+        className: "starting"
+      };
+    }
+
+    if (value === "STOPPING") {
+      return {
+        text: "🟡 جاري تأكيد التوقف",
+        className: "stopping"
+      };
+    }
+
+    if (value === "GPS_LOST") {
+      return {
+        text: "🔴 GPS غير محدث",
+        className: "gpslost"
+      };
+    }
+
+    return {
+      text: "الحالة غير معروفة",
+      className: "unknown"
+    };
+  }
+
+  function workInfo(status) {
+    if (status === "WORKING") {
+      return {
+        text: "محسوب كعمل",
+        className: "working"
+      };
+    }
+
+    if (status === "NON_WORK_LOCATION") {
+      return {
+        text: "غير محسوب كعمل",
+        className: "nonwork"
+      };
+    }
+
+    return {
+      text: "لا توجد رحلة عمل جارية",
+      className: "notworking"
+    };
+  }
+
+  function formatDate(value) {
+    if (!value) return "—";
+
+    try {
+      return new Intl.DateTimeFormat("ar-SA", {
+        timeZone: "Asia/Riyadh",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+      }).format(new Date(value));
+    } catch {
+      return value;
+    }
+  }
+
+  function formatDuration(startedAt) {
+    if (!startedAt) return "—";
+
+    const start = new Date(startedAt).getTime();
+
+    if (!Number.isFinite(start)) {
+      return "—";
+    }
+
+    const milliseconds = Math.max(0, Date.now() - start);
+
+    const totalMinutes =
+      Math.floor(milliseconds / 60000);
+
+    const hours =
+      Math.floor(totalMinutes / 60);
+
+    const minutes =
+      totalMinutes % 60;
+
+    if (hours > 0) {
+      return `${hours} ساعة و ${minutes} دقيقة`;
+    }
+
+    return `${minutes} دقيقة`;
+  }
+
+  function formatDistance(meters) {
+    const value = Number(meters);
+
+    if (!Number.isFinite(value)) {
+      return "—";
+    }
+
+    if (value >= 1000) {
+      return `${(value / 1000).toFixed(2)} كم`;
+    }
+
+    return `${Math.round(value)} متر`;
+  }
+
+  function renderVehicle(vehicle) {
+    const state = stateInfo(vehicle.state);
+    const work = workInfo(vehicle.work_status);
+
+    const currentLocation =
+      vehicle.inside_non_work_location
+        ? vehicle.location_name || "موقع غير محسوب"
+        : "خارج المواقع المستثناة";
+
+    const nearestLocation =
+      vehicle.nearest_location_name || "—";
+
+    const nearestDistance =
+      vehicle.nearest_location_distance_m == null
+        ? "—"
+        : `${vehicle.nearest_location_distance_m} متر`;
+
+    const trip = vehicle.current_trip;
+
+    const gpsWarning =
+      vehicle.gps_stale
+        ? `
+          <div class="gps-warning">
+            ⚠️ بيانات GPS قديمة — آخر تحديث قبل
+            ${escapeHtml(vehicle.gps_age_minutes ?? "—")} دقيقة
+          </div>
+        `
+        : "";
+
+    const coordinates =
+      vehicle.latitude != null &&
+      vehicle.longitude != null
+        ? `${vehicle.latitude}, ${vehicle.longitude}`
+        : "—";
+
+    return `
+      <section class="card">
+
+        <div class="card-top">
+          <div>
+            <div class="vehicle-name">
+              ${escapeHtml(vehicle.name)}
+            </div>
+
+            <div class="badge ${state.className}">
+              ${state.text}
+            </div>
+          </div>
+
+          <div class="work ${work.className}">
+            ${work.text}
+          </div>
+        </div>
+
+        <div class="location">
+          <div class="location-title">
+            📍 الموقع الحالي
+          </div>
+
+          <div class="location-name">
+            ${escapeHtml(currentLocation)}
+          </div>
+
+          <div class="small">
+            أقرب موقع مسجل:
+            ${escapeHtml(nearestLocation)}
+            —
+            ${escapeHtml(nearestDistance)}
+          </div>
+        </div>
+
+        ${gpsWarning}
+
+        <div class="rows">
+
+          <div class="row">
+            <span>آخر سرعة مسجلة</span>
+            <strong>
+              ${escapeHtml(vehicle.speed_kmh ?? 0)} كم/س
+            </strong>
+          </div>
+
+          <div class="row">
+            <span>حالة العمل</span>
+            <strong>
+              ${escapeHtml(work.text)}
+            </strong>
+          </div>
+
+          <div class="row">
+            <span>أقرب موقع مسجل</span>
+            <strong>
+              ${escapeHtml(nearestLocation)}
+            </strong>
+          </div>
+
+          <div class="row">
+            <span>المسافة من الموقع</span>
+            <strong>
+              ${escapeHtml(nearestDistance)}
+            </strong>
+          </div>
+
+          <div class="row">
+            <span>آخر GPS</span>
+            <strong>
+              ${escapeHtml(formatDate(vehicle.last_device_time))}
+            </strong>
+          </div>
+
+          <div class="row">
+            <span>عمر GPS</span>
+            <strong>
+              ${
+                vehicle.gps_age_minutes == null
+                  ? "—"
+                  : `${escapeHtml(vehicle.gps_age_minutes)} دقيقة`
+              }
+            </strong>
+          </div>
+
+          <div class="row">
+            <span>بداية الرحلة الحالية</span>
+            <strong>
+              ${
+                trip
+                  ? escapeHtml(formatDate(trip.started_at))
+                  : "—"
+              }
+            </strong>
+          </div>
+
+          <div class="row">
+            <span>مدة الرحلة الحالية</span>
+            <strong>
+              ${
+                trip
+                  ? escapeHtml(formatDuration(trip.started_at))
+                  : "—"
+              }
+            </strong>
+          </div>
+
+          <div class="row">
+            <span>مسافة الرحلة الحالية</span>
+            <strong>
+              ${
+                trip
+                  ? escapeHtml(formatDistance(trip.distance_meters))
+                  : "—"
+              }
+            </strong>
+          </div>
+
+          <div class="row">
+            <span>الإحداثيات</span>
+            <strong>
+              ${escapeHtml(coordinates)}
+            </strong>
+          </div>
+
+        </div>
+      </section>
+    `;
+  }
+
+  async function loadDashboard() {
+    const errorBox =
+      document.getElementById("errorBox");
+
+    const grid =
+      document.getElementById("vehicleGrid");
+
+    try {
+      errorBox.style.display = "none";
+      errorBox.textContent = "";
+
+      const response = await fetch(
+        API_URL,
+        {
+          method: "GET",
+          cache: "no-store",
+          headers: {
+            "Accept": "application/json"
+          }
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(
+          `HTTP ${response.status}`
+        );
+      }
+
+      const data =
+        await response.json();
+
+      if (!data.ok) {
+        throw new Error(
+          data.error || "API returned an error"
+        );
+      }
+
+      const vehicles =
+        Array.isArray(data.vehicles)
+          ? data.vehicles
+          : [];
+
+      document.getElementById(
+        "totalVehicles"
+      ).textContent =
+        data.summary?.total ??
+        vehicles.length;
+
+      document.getElementById(
+        "movingVehicles"
+      ).textContent =
+        data.summary?.moving ??
+        vehicles.filter(
+          vehicle =>
+            vehicle.state === "MOVING"
+        ).length;
+
+      document.getElementById(
+        "workingVehicles"
+      ).textContent =
+        data.summary?.working ??
+        vehicles.filter(
+          vehicle =>
+            vehicle.work_status === "WORKING"
+        ).length;
+
+      document.getElementById(
+        "nonWorkVehicles"
+      ).textContent =
+        data.summary?.non_work_location ??
+        vehicles.filter(
+          vehicle =>
+            vehicle.work_status ===
+            "NON_WORK_LOCATION"
+        ).length;
+
+      if (vehicles.length === 0) {
+        grid.innerHTML =
+          '<div class="loading">لا توجد مركبات مفعلة حاليًا.</div>';
+
+        return;
+      }
+
+      grid.innerHTML =
+        vehicles
+          .map(renderVehicle)
+          .join("");
+
+    } catch (error) {
+      console.error(
+        "Dashboard fetch error:",
+        error
+      );
+
+      errorBox.style.display =
+        "block";
+
+      errorBox.textContent =
+        `تعذر تحميل البيانات: ${
+          error instanceof Error
+            ? error.message
+            : String(error)
+        }`;
+
+      grid.innerHTML = "";
+    }
+  }
+
+  loadDashboard();
+
+  setInterval(
+    loadDashboard,
+    30000
+  );
 </script>
+
 </body>
 </html>
