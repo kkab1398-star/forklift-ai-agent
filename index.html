@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>مركز متابعة السائقين</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f1f5f9;color:#0f172a;font-family:Tahoma,Arial,sans-serif}
+header{background:#0f172a;color:#fff;padding:26px 5%}header h1{margin:0 0 6px;font-size:30px}header p{margin:0;color:#cbd5e1}
+main{width:92%;max-width:1400px;margin:24px auto}.summary,.grid{display:grid;gap:16px}.summary{grid-template-columns:repeat(4,1fr);margin-bottom:20px}
+.box,.card{background:#fff;border-radius:18px;padding:18px;box-shadow:0 4px 16px #0f172a12}.num{font-size:30px;font-weight:800;margin-top:7px}.muted{color:#64748b}
+.grid{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}.top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+.name{font-size:28px;font-weight:800}.pill{display:inline-block;margin-top:8px;padding:8px 12px;border-radius:999px;font-weight:700;font-size:14px}
+.moving,.working{background:#dcfce7;color:#047857}.stopped{background:#e2e8f0;color:#334155}.starting{background:#ede9fe;color:#6d28d9}
+.stopping{background:#fef3c7;color:#92400e}.gpslost{background:#fee2e2;color:#b91c1c}.nonwork{background:#dbeafe;color:#1d4ed8}.unknown{background:#f1f5f9;color:#475569}
+.location{margin-top:17px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:14px;padding:15px}.location b{font-size:19px}
+.row{display:flex;justify-content:space-between;gap:18px;padding:11px 0;border-bottom:1px solid #e2e8f0}.row span{color:#64748b}.row strong{text-align:left}
+.warn{color:#b91c1c}.footer{text-align:center;color:#64748b;padding:25px}.error{background:#fee2e2;color:#991b1b;padding:18px;border-radius:14px}
+@media(max-width:720px){.summary{grid-template-columns:repeat(2,1fr)}.top{display:block}}
+</style>
+</head>
+<body>
+<header><h1>مركز متابعة السائقين</h1><p>Forklift AI Agent — البيانات مباشرة من Supabase</p></header>
+<main>
+<div id="status" class="muted">جاري تحميل البيانات…</div>
+<div id="summary" class="summary"></div>
+<div id="grid" class="grid"></div>
+</main>
+<div class="footer">تحديث تلقائي كل 30 ثانية — توقيت مكة المكرمة</div>
+<script>
+const API="https://zwadkjczawezdohhcrmav.supabase.co/functions/v1/fleet-dashboard";
+
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
+const fmt=t=>t?new Intl.DateTimeFormat("ar-SA",{timeZone:"Asia/Riyadh",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}).format(new Date(t)):"—";
+const duration=t=>{if(!t)return"—";let m=Math.max(0,Math.floor((Date.now()-new Date(t))/60000));return m<60?`${m} دقيقة`:`${Math.floor(m/60)} ساعة${m%60?` و ${m%60} دقيقة`:""}`};
+function stateInfo(s){
+  return ({MOVING:["🟢","متحرك","moving"],STARTING:["🟣","جاري تأكيد الحركة","starting"],STOPPING:["🟡","جاري تأكيد التوقف","stopping"],STOPPED:["⚪","متوقف","stopped"],GPS_LOST:["⚠️","فقد GPS","gpslost"]})[s]||["❔","غير معروف","unknown"];
+}
+async function load(){
+  const status=document.getElementById("status");
+  try{
+    const r=await fetch(API,{cache:"no-store"});
+    if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d=await r.json();
+    if(!d.ok) throw new Error(d.error||"API error");
+    const vs=d.vehicles||[];
+    const moving=vs.filter(v=>v.state==="MOVING").length;
+    const working=vs.filter(v=>v.work_status==="WORKING").length;
+    const nonwork=vs.filter(v=>v.work_status==="NON_WORK_LOCATION").length;
+    document.getElementById("summary").innerHTML=[
+      ["إجمالي المركبات",vs.length],["متحركة الآن",moving],["رحلات عمل جارية",working],["داخل مواقع غير محسوبة",nonwork]
+    ].map(x=>`<div class="box"><div class="muted">${x[0]}</div><div class="num">${x[1]}</div></div>`).join("");
+    document.getElementById("grid").innerHTML=vs.map(v=>{
+      const [icon,label,cls]=stateInfo(v.state);
+      const work=v.work_status==="WORKING"?"رحلة عمل جارية":v.work_status==="NON_WORK_LOCATION"?"غير محسوب كعمل":"لا توجد رحلة عمل جارية";
+      const wcls=v.work_status==="WORKING"?"working":v.work_status==="NON_WORK_LOCATION"?"nonwork":"stopped";
+      const place=v.inside_non_work_location?(v.location_name||"موقع مستثنى"):"خارج المواقع المستثناة";
+      const trip=v.current_trip;
+      return `<section class="card">
+        <div class="top"><div><div class="name">${esc(v.name)}</div><div class="pill ${cls}">${icon} ${label}</div></div><div class="pill ${wcls}">${work}</div></div>
+        <div class="location"><div class="muted">📍 الموقع الحالي</div><b>${esc(place)}</b>${v.nearest_location_distance_m!=null?`<div class="muted">أقرب موقع مسجل: ${esc(v.nearest_location_name)} — ${esc(v.nearest_location_distance_m)} متر</div>`:""}</div>
+        <div class="row"><span>آخر سرعة مسجلة</span><strong>${esc(v.speed_kmh)} كم/س</strong></div>
+        <div class="row"><span>حالة العمل</span><strong>${work}</strong></div>
+        <div class="row"><span>آخر GPS</span><strong>${fmt(v.last_device_time)}</strong></div>
+        <div class="row"><span>عمر GPS</span><strong class="${v.gps_stale?"warn":""}">${v.gps_age_minutes==null?"غير معروف":esc(v.gps_age_minutes)+" دقيقة"}${v.gps_stale?" ⚠️":""}</strong></div>
+        <div class="row"><span>بداية الرحلة الحالية</span><strong>${trip?fmt(trip.started_at):"—"}</strong></div>
+        <div class="row"><span>مدة الرحلة الحالية</span><strong>${trip?duration(trip.started_at):"—"}</strong></div>
+        <div class="row"><span>مسافة الرحلة الحالية</span><strong>${trip?(Number(trip.distance_meters||0)/1000).toFixed(2)+" كم":"—"}</strong></div>
+        <div class="row"><span>الإحداثيات</span><strong>${v.latitude==null?"—":esc(v.latitude)+", "+esc(v.longitude)}</strong></div>
+      </section>`;
+    }).join("");
+    status.textContent=`آخر تحديث للوحة: ${fmt(d.generated_at)}`;
+  }catch(e){
+    status.innerHTML=`<div class="error">تعذر تحميل البيانات: ${esc(e.message)}</div>`;
+  }
+}
+load(); setInterval(load,30000);
+</script>
+</body>
+</html>
