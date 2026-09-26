@@ -12,6 +12,49 @@ app = Flask(__name__)
 API_KEY = os.environ.get("TRUSTTRACK_API_KEY")
 BASE_URL = "https://api.fm-track.com"
 
+# =========================================================
+# Supabase - التخزين الدائم
+# =========================================================
+SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or ""
+
+def supabase_enabled():
+    return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+def supabase_headers(prefer=None):
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+def supabase_request(method, table, params=None, payload=None, prefer=None):
+    if not supabase_enabled():
+        raise RuntimeError(
+            "Supabase is not configured. Add SUPABASE_URL and "
+            "SUPABASE_SERVICE_ROLE_KEY to the server environment."
+        )
+
+    response = requests.request(
+        method,
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=supabase_headers(prefer),
+        params=params,
+        json=payload,
+        timeout=20,
+    )
+    response.raise_for_status()
+
+    if response.content:
+        try:
+            return response.json()
+        except Exception:
+            return None
+    return None
+
 
 # =========================================================
 # إعدادات تحليل الحركة
@@ -252,67 +295,91 @@ def distance_meters(
 
 
 # =========================================================
-# ذاكرة المركبات
+# ذاكرة المركبات - Supabase مع fallback محلي
 # =========================================================
 def load_state():
+    if supabase_enabled():
+        try:
+            rows = supabase_request(
+                "GET",
+                "forklift_state",
+                params={"select": "vehicle_name,state"},
+            ) or []
+            result = {}
+            for row in rows:
+                name = row.get("vehicle_name")
+                state_value = row.get("state")
+                if name and isinstance(state_value, dict):
+                    result[name] = state_value
+            return result
+        except Exception as error:
+            print("Supabase state load error:", error)
 
+    # fallback محلي حتى لا تتوقف الخدمة إذا تعذر Supabase مؤقتاً
     try:
-
-        if os.path.exists(
-            STATE_FILE
-        ):
-
-            with open(
-                STATE_FILE,
-                "r",
-                encoding="utf-8"
-            ) as file:
-
-                data = json.load(
-                    file
-                )
-
-                if isinstance(
-                    data,
-                    dict
-                ):
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as file:
+                data = json.load(file)
+                if isinstance(data, dict):
                     return data
-
     except Exception:
         pass
-
     return {}
 
 
 def save_state(state):
+    if supabase_enabled():
+        try:
+            rows = [
+                {
+                    "vehicle_name": name,
+                    "state": value,
+                    "updated_at": now_utc_iso(),
+                }
+                for name, value in state.items()
+            ]
+            if rows:
+                supabase_request(
+                    "POST",
+                    "forklift_state",
+                    params={"on_conflict": "vehicle_name"},
+                    payload=rows,
+                    prefer="resolution=merge-duplicates,return=minimal",
+                )
+            return
+        except Exception as error:
+            print("Supabase state save error:", error)
 
     try:
-
-        with open(
-            STATE_FILE,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            json.dump(
-                state,
-                file,
-                ensure_ascii=False,
-                indent=2
-            )
-
+        with open(STATE_FILE, "w", encoding="utf-8") as file:
+            json.dump(state, file, ensure_ascii=False, indent=2)
     except Exception as error:
-
-        print(
-            "State save error:",
-            error
-        )
+        print("State save error:", error)
 
 
 # =========================================================
-# سجل الأحداث المؤقت
+# سجل الأحداث - Supabase مع fallback محلي
 # =========================================================
 def load_history():
+    if supabase_enabled():
+        try:
+            rows = supabase_request(
+                "GET",
+                "forklift_events",
+                params={
+                    "select": "raw_data",
+                    "order": "event_time.asc",
+                    "limit": str(MAX_HISTORY_EVENTS),
+                },
+            ) or []
+            return [
+                row.get("raw_data")
+                for row in rows
+                if isinstance(row.get("raw_data"), dict)
+            ]
+        except Exception as error:
+            print("Supabase history load error:", error)
+
     try:
         if os.path.exists(HISTORY_FILE):
             with open(HISTORY_FILE, "r", encoding="utf-8") as file:
@@ -325,6 +392,10 @@ def load_history():
 
 
 def save_history(history):
+    # في وضع Supabase يتم الحفظ مباشرة بواسطة record_event.
+    if supabase_enabled():
+        return
+
     try:
         with open(HISTORY_FILE, "w", encoding="utf-8") as file:
             json.dump(history[-MAX_HISTORY_EVENTS:], file, ensure_ascii=False, indent=2)
@@ -333,15 +404,57 @@ def save_history(history):
 
 
 def record_event(event):
+    if supabase_enabled():
+        try:
+            event_time = event.get("time") or now_utc_iso()
+            supabase_request(
+                "POST",
+                "forklift_events",
+                payload={
+                    "vehicle_name": str(event.get("vehicle") or "unknown"),
+                    "event_type": str(event.get("event") or event.get("status") or "event"),
+                    "event_time": event_time,
+                    "latitude": event.get("latitude"),
+                    "longitude": event.get("longitude"),
+                    "speed": event.get("speed"),
+                    "place": event.get("location"),
+                    "distance_m": event.get("distance_to_nearest_meters"),
+                    "raw_data": event,
+                },
+                prefer="return=minimal",
+            )
+            return
+        except Exception as error:
+            print("Supabase event save error:", error)
+
     history = load_history()
     history.append(event)
     save_history(history)
 
 
 # =========================================================
-# سجل الرحلات المؤقت
+# سجل الرحلات - Supabase مع fallback محلي
 # =========================================================
 def load_trips():
+    if supabase_enabled():
+        try:
+            rows = supabase_request(
+                "GET",
+                "forklift_trips",
+                params={
+                    "select": "raw_data",
+                    "order": "start_time.asc",
+                    "limit": str(MAX_TRIPS),
+                },
+            ) or []
+            return [
+                row.get("raw_data")
+                for row in rows
+                if isinstance(row.get("raw_data"), dict)
+            ]
+        except Exception as error:
+            print("Supabase trips load error:", error)
+
     try:
         if os.path.exists(TRIPS_FILE):
             with open(TRIPS_FILE, "r", encoding="utf-8") as file:
@@ -354,6 +467,10 @@ def load_trips():
 
 
 def save_trips(trips):
+    # في وضع Supabase يتم الحفظ مباشرة بواسطة record_trip.
+    if supabase_enabled():
+        return
+
     try:
         with open(TRIPS_FILE, "w", encoding="utf-8") as file:
             json.dump(trips[-MAX_TRIPS:], file, ensure_ascii=False, indent=2)
@@ -362,6 +479,43 @@ def save_trips(trips):
 
 
 def record_trip(trip):
+    if supabase_enabled():
+        try:
+            start_time = trip.get("start_time") or now_utc_iso()
+            end_time = trip.get("end_time")
+            duration_minutes = float(trip.get("duration_minutes") or 0)
+            trip_id = (
+                f"{trip.get('vehicle') or 'unknown'}-"
+                f"{start_time}"
+            )
+
+            supabase_request(
+                "POST",
+                "forklift_trips",
+                params={"on_conflict": "trip_id"},
+                payload={
+                    "vehicle_name": str(trip.get("vehicle") or "unknown"),
+                    "trip_id": trip_id,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "start_lat": trip.get("start_latitude"),
+                    "start_lon": trip.get("start_longitude"),
+                    "end_lat": trip.get("end_latitude"),
+                    "end_lon": trip.get("end_longitude"),
+                    "start_place": trip.get("start_location"),
+                    "end_place": trip.get("end_location"),
+                    "distance_m": float(trip.get("distance_meters") or 0),
+                    "duration_seconds": int(round(duration_minutes * 60)),
+                    "status": "CLOSED" if end_time else "OPEN",
+                    "raw_data": trip,
+                    "updated_at": now_utc_iso(),
+                },
+                prefer="resolution=merge-duplicates,return=minimal",
+            )
+            return
+        except Exception as error:
+            print("Supabase trip save error:", error)
+
     trips = load_trips()
     trips.append(trip)
     save_trips(trips)
@@ -1391,7 +1545,8 @@ def health():
 
     return jsonify(
         {
-            "status": "ok"
+            "status": "ok",
+            "storage": "supabase" if supabase_enabled() else "local-fallback"
         }
     )
 
@@ -1688,7 +1843,7 @@ body{margin:0;font-family:Arial,Tahoma,sans-serif;background:#f1f5f9;color:#0f17
 </style></head><body>
 <div class="header"><h1>📊 التقرير اليومي</h1><div>تقرير {{ today }} — توقيت مكة المكرمة — تحديث كل 30 ثانية</div></div>
 <div class="actions"><a class="button" href="/dashboard">لوحة المتابعة</a><a class="button" href="/history">سجل الأحداث</a><a class="button" href="/trips">الرحلات</a></div>
-<div class="note">ملاحظة: البيانات مؤقتة حالياً على Render وتبدأ من آخر تشغيل للخدمة إلى أن ننقل التخزين لقاعدة البيانات الدائمة.</div>
+<div class="note">التخزين الدائم: حالة المركبات والأحداث والرحلات محفوظة في Supabase عند توفر إعدادات الاتصال.</div>
 <div class="grid">{% for r in reports %}<div class="card"><div class="name">{{ r.name }}</div>
 <div class="row"><span class="label">الحالة الحالية</span><span class="value">{{ r.status }}</span></div>
 <div class="row"><span class="label">عدد الرحلات المكتملة اليوم</span><span class="value">{{ r.trips_count }}</span></div>
